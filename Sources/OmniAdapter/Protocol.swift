@@ -23,10 +23,6 @@ public enum Protocol {
     /// connect-client node.
     public static let adapterClientType = "adapter"
 
-    // 원본: 서버 `stage.ts` 의 AdapterNodeType enum.
-    /// Discriminator for the Backstage node shape — kept in lockstep with the server's enum.
-    public static let adapterNodeTypes = ["web", "service", "hardware", "sensor", "controller", "display"]
-
     // 원본: 서버 stage.ts providesView enum.
     /// Ways of providing a view — kept in lockstep with the server's enum.
     /// What the Stage's view slots (Adapter View / Adapter Stream layers) use to narrow candidate

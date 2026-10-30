@@ -36,8 +36,7 @@ enum Resilience {
                     secretKey: credential,
                     displayName: "Swift Resilience",
                     osHostname: ProcessInfo.processInfo.hostName,
-                    sends: ["heartbeat.tick"],
-                    nodeType: "sensor"
+                    sends: ["heartbeat.tick"]
                     // autoRejoin 은 기본 true — 스테이지가 닫히면 같이 끝나야 하는
                     // 일회성 스크립트만 `options.autoRejoin = false` 로 끈다.
                 )

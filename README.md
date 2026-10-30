@@ -43,8 +43,7 @@ let client = try await connect(
         secretKey: ProcessInfo.processInfo.environment["CONNECT_TOKEN"], // "cst_…"
         displayName: "iPad Wall",
         receives: ["actuator.cmd"],          // declared → Backstage port chips
-        sends: ["sensor.temperature"],
-        nodeType: "display"                  // web|service|hardware|sensor|controller|display
+        sends: ["sensor.temperature"]
     )
 )
 
@@ -72,7 +71,7 @@ let package = Package(
     name: "MyAdapter",
     platforms: [.macOS(.v10_15), .iOS(.v13)],   // required — without it SwiftPM refuses the dependency
     dependencies: [
-        .package(url: "https://github.com/ProtoPie/omni-adapter-swift", from: "0.1.0-beta.0"),
+        .package(url: "https://github.com/ProtoPie/omni-adapter-swift", from: "0.1.0-beta.1"),
     ],
     targets: [
         .executableTarget(
@@ -87,9 +86,9 @@ let package = Package(
 In an Xcode app project: File → Add Package Dependencies… and enter the URL above.
 
 Only beta versions are published so far, and SwiftPM never picks a prerelease unless the
-requirement names one: `from: "0.1.0"` finds nothing, while `from: "0.1.0-beta.0"` takes the beta
-and later 0.1.0 as well. In Xcode, set the dependency rule's lower bound to `0.1.0-beta.0` (or
-choose Exact Version). Mirror tags carry no prefix — the version is the tag itself (`0.1.0-beta.0`).
+requirement names one: `from: "0.1.0"` finds nothing, while `from: "0.1.0-beta.1"` takes the beta
+and later 0.1.0 as well. In Xcode, set the dependency rule's lower bound to `0.1.0-beta.1` (or
+choose Exact Version). Mirror tags carry no prefix — the version is the tag itself (`0.1.0-beta.1`).
 
 Working from a checkout of the main repository instead (contributors, or a change that has
 not reached the mirror yet)? Depend on its `swift/` folder by path —
@@ -214,7 +213,7 @@ await client.latestJSON("robot.status")
 await client.history()                                       // replay ring (≤1000, not storage)
 await client.history("chat.*")                               // …filtered (wildcards ok)
 await client.historyJSON("chat.message")
-try await client.members()  // each Member also carries nodeType · receives · sends · clientType · strictRouting · exclusiveName · osHostname (nil on older servers); member.declaresChannel("robot.status")
+try await client.members()  // each Member also carries receives · sends · clientType · strictRouting · exclusiveName · osHostname (nil on older servers); member.declaresChannel("robot.status")
 try await client.listeners("robot.status")  // who will receive it: .declared / .broadcast (self excluded); records no-listener when nobody declared it
 
 let push = await client.throttle("nav.position", hz: 10)     // coalesced sender (trailing flush)

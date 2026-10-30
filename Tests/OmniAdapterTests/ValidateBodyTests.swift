@@ -81,7 +81,7 @@ final class ValidateBodyTests: XCTestCase {
     func testUndeclaredFieldsAreOmittedEntirely() async throws {
         // "신고 안 함"과 "기본값 주장"은 다르다 — 서버의 보존 규칙이 둘을 다르게 본다.
         let captured = try await captureValidate()
-        for key in ["exclusiveName", "providesView", "nodeType", "receives", "sends"] {
+        for key in ["exclusiveName", "providesView", "receives", "sends"] {
             XCTAssertNil(captured.body[key], "\(key) should be absent")
         }
     }
@@ -107,7 +107,6 @@ final class ValidateBodyTests: XCTestCase {
             $0.osHostname = "line-3"
             $0.receives = ["a.in"]
             $0.sends = ["a.out"]
-            $0.nodeType = "sensor"
             $0.providesView = "web"
             $0.exclusiveName = true
             $0.strictRouting = true
@@ -121,12 +120,10 @@ final class ValidateBodyTests: XCTestCase {
         let captured = try await captureValidate {
             $0.receives = ["actuator.cmd"]
             $0.sends = ["sensor.temperature"]
-            $0.nodeType = "hardware"
             $0.providesView = "stream"
         }
         XCTAssertEqual(captured.body["receives"] as? [String], ["actuator.cmd"])
         XCTAssertEqual(captured.body["sends"] as? [String], ["sensor.temperature"])
-        XCTAssertEqual(captured.body["nodeType"] as? String, "hardware")
         XCTAssertEqual(captured.body["providesView"] as? String, "stream")
     }
 

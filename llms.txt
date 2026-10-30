@@ -1,0 +1,941 @@
+# Omni Adapter
+
+> The official adapter library for joining a ProtoPie **Connect Omni** stage from your own program — TypeScript/JavaScript (incl. React), Python, C#/.NET (incl. Unity), Kotlin/JVM/Android, Swift and Dart/Flutter — and exchanging real-time messages with prototypes, people and other programs over named channels. One credential (an adapter token, `cst_…`); values are primitives, objects travel as JSON strings. This file is written for AI coding assistants: read the first three sections, then only the section for your language — each language section stands on its own.
+
+## Contents
+
+1. [The credential](#the-credential)
+2. [Rules that prevent most bugs](#rules-that-prevent-most-bugs)
+3. [Concepts and the six-language name map](#concepts-and-the-six-language-name-map) — [name map](#name-map) · [lifecycle events per language](#lifecycle-events-per-language) · [sessions and names](#sessions-and-names) · [delivery](#delivery-acks-offline-queue-standby) · [latest and history](#latest-and-history)
+4. Languages — [TypeScript / JavaScript](#typescript--javascript) (+ React) · [Python](#python) · [C# / .NET](#c--net) · [Kotlin / JVM / Android](#kotlin--jvm--android) · [Swift](#swift) · [Dart / Flutter](#dart--flutter)
+5. [Errors and troubleshooting](#errors-and-troubleshooting)
+6. [Roster, diagnostics, testing, CLI](#roster-diagnostics-testing-cli)
+7. [Optional](#optional) — screens (Adapter View, screen broadcast, remote input), Unity checklist, Android Automotive input injection, links
+
+## The credential
+
+- **One value: an adapter token, `cst_…`.** An Editor or Owner of the stage creates it in the Connect web app: open the stage → **Share → Adapter keys → Create key**, then **Copy**. Copy appears only right after Create key and the token is shown once — if it is lost, create a new key. The token carries the server address and the stage id; its secret is an individually revocable adapter key (`ck_…`).
+- The only other accepted form is that bare `ck_…` key plus explicit `url` and `stageId`. Anything else (a share link, a share token) is rejected with `ConfigError` before any network call.
+- Read it from an environment variable or secret store — never hard-code or log it. Pass it exactly: whitespace around it (typically the newline a token file ends with) is rejected with `ConfigError: credential has leading or trailing whitespace`; an unset variable gives a `ConfigError` whose hint says so.
+- The **key name** typed at Create key only labels the key in the key list. The name the stage shows is `displayName` in your code.
+- Use one token per program and machine (revoking a token disconnects every program using it) — except a deliberate standby copy, which shares its active program's token (see [sessions and names](#sessions-and-names)).
+
+## Rules that prevent most bugs
+
+1. **Lifecycle events have different names in each language** — use the [table](#lifecycle-events-per-language). Only TypeScript and Python use reserved names on `on()`; in C#, Kotlin, Swift and Dart, `client.on("error", …)` subscribes to a *channel* called `error` and never fires for adapter errors.
+2. **Values are primitives** — string, number, boolean, null. Objects go through the JSON helpers (`sendJSON` / `send_json` / `SendJsonAsync` / `sendJson`) and the receiver uses the matching `onJSON` helper. A non-primitive value fails that call with `ValidationError` (Swift's `Primitive` enum rejects it at compile time) — the push function `throttle()` returns included. **Prototypes and the Console send every value as a string** (`"42"`, not `42`) or `null` when the message carries none — convert before comparing; programs receive whatever type another program sent. A message a prototype, a Figma or Unity layer or the Console sends arrives with **its name as the channel** (`on('door.open')` fires) on servers from 2026-10-19; older servers deliver those on the channel `STUDIO` with the name in `messageId`, so a name subscription never fires there — to support one, subscribe to `STUDIO` (with `strictRouting`, declare `receives: ['STUDIO']`) and read the name from `msg.messageId`.
+3. **Subscribe to errors and to the session end** in every unattended program, and print the code with `hint ?? message`: several codes carry no hint (`AckTimeout`, `ValidationError`, `SessionEnded`, some `ConfigError`s), and for some (`AckTimeout`) the message is only the code itself — say which call failed. C#, Kotlin and Swift print nothing on their own.
+4. **Close the client on exit — on Ctrl+C (SIGINT) and on SIGTERM** (docker stop, systemd, kill). `close()` ends the client at the call and leaves the stage — it waits up to 1 s for the server to confirm — so the seat and the name are freed at once. It **drops queued fire-and-forget sends**: to be sure the last values went out, await an acked send or wait until `queuedCount` is 0 first. A program that dies without `close()` leaves its seat for about 10 s (the server's guest grace — 8 s on servers before 2026-10-19); the same key keeps its name on restart (older servers renamed such a restart to `name (2)`).
+5. **A live session must exist** when you connect, otherwise `connect` fails with `RoomEnded`: someone with edit rights opens the stage in Connect, or you connect with a key created with **Let adapters start a session** turned on (Share → Adapter keys).
+6. **No self-echo.** The server never sends your own messages back to you, so your handlers never see them and UI lists need optimistic appends. `latest()` folds your own sends in locally — it is not proof that a send went out; use `ack: true` or watch from a second connection.
+7. **History re-seeds state, it never re-fires triggers.** After a reconnect `latest()`/`history()` are re-seeded and the history event fires, but nothing missed is replayed into channel handlers. Read state channels with `latest()` when the state becomes `connected`; trigger channels are at-most-once across a disconnect.
+8. **`connected` does not mean messages are flowing.** Check `state` and `queuedCount` together — see [connected but nothing happens](#connected-but-nothing-happens).
+9. **Never block inside a callback.** Callbacks run one at a time in arrival order; a blocked callback holds back every later message and every ack reply. Each language section says which thread you are on and how to hop.
+10. **Reuse one client, and stay under 60 messages a second.** Each connection takes one guest seat of the stage's cap; never connect per message. The server takes at most 60 messages a second per connection — coalesce high-rate sources with `throttle()`, and never use `ack: true` for a stream (acked sends go one per round trip).
+11. **Declare channels precisely.** `receives`/`sends` list channel names (up to 32 each); omit a field to declare nothing — an empty list is a `ConfigError`. Wildcards (`robot.*`) are allowed in `receives` only without `strictRouting`. `strictRouting: true` needs a non-empty `receives` of exact names; the server then delivers only those (plus messages targeted at you), and subscribing to anything else receives nothing.
+12. **When connecting fails, run the doctor before changing code** — it names the broken step. It checks the connection, not delivery: a green doctor plus a silent peer means the channel name, the routing or the receiving side is wrong.
+13. **An `AckTimeout` does not prove the server missed the message** — nor does `QueueOverflow`, `Standby` or `SessionEnded` on a queued acked send that had already gone out once; a blind retry can publish it twice.
+
+## Concepts and the six-language name map
+
+A **stage** is a shared Connect workspace; prototypes, people and programs on it exchange messages on dot-separated **channels** (`door.open`, `line3.temp`) — what ProtoPie calls a *message*. A **session** is a stage that is running now. Every connected program appears as a node on the stage's **Backstage** canvas and as the *Source* of its messages in the **Console**. In subscriptions `*` matches one or more dot segments: `robot.*` matches `robot.arm` and `robot.arm.pos`; `*` alone matches everything.
+
+### Name map
+
+| Concept | TypeScript | Python | C# | Kotlin | Swift | Dart |
+| --- | --- | --- | --- | --- | --- | --- |
+| connect | `await connect({…})` | `await omni_adapter.connect(…)` | `await Connect.ToStageAsync(new ConnectOptions {…})` | `connect(ConnectOptions(…))` (suspend) | `try await connect(ConnectOptions(…))` | `await connect(ConnectOptions(…))` |
+| send a primitive | `send(ch, v, { ack: true })` | `await send(ch, v, ack=True)` | `await SendAsync(ch, v, ack: true)` | `send(ch, v, ack = true)` | `try await send(ch, .double(x), ack: true)` | `await send(ch, v, ack: true)` |
+| send an object | `sendJSON` | `send_json` | `SendJsonAsync` | `sendJson` (Map/List/`JSONObject`/`JSONArray`) | `sendJSON` (`[String: Any]`, `[Any]`) | `sendJson` |
+| subscribe | `on(p, cb)` → unsubscribe fn | `on(p, cb)` → unsubscribe fn, or `@client.on(p)` | `On(p, cb)` → `IDisposable` | `on(p) { }` → `Closeable` | `await on(p) { }` → `Subscription` | `on(p, cb)` → unsubscribe fn |
+| receive JSON | `onJSON(p, (value, msg) => …)` | `on_json(p, cb(value, msg))` | `OnJson<T>(p, (value, msg) => …)` | `onJson(p) { value, msg -> }` | `onJSON(p) { value, msg in }` | `onJson(p, (value) {…})` |
+| lifecycle events | `on('error', …)` | `on("error", …)` | `client.Error += …` | `events` flow, `state` flow | `events()` stream | `onEvent('error', …)` |
+| last value | `latest(ch)` → `undefined` if unknown | `latest(ch)` → `None` | `Latest(ch)` → `object?` | `latest(ch)` → `Any?` | `await latest(ch)` → `Primitive?` | `latest(ch)` → `Object?` |
+| state now | `state` (string) | `state` (str) | `State` (string) | `state.value` (String) | `await state` (`TransportState`) | `state` (`TransportState`) |
+| backlog · standby | `queuedCount` · `standby` | `queued_count` · `standby` | `QueuedCount` · `Standby` | `queuedCount` · `standby` | `await queuedCount` · `await standby` | `queuedCount` · `standby` |
+| close | `await close()` | `await close()` | `await CloseAsync()` / `Dispose()` | `close()` (suspend) | `await close()` | `await close()` |
+| doctor | `runDoctor` + `formatDoctorReport` | `run_doctor` + `format_doctor_report` | `Doctor.RunAsync` + `Doctor.FormatReport` | `runDoctor` + `formatDoctorReport` | `runDoctor(credential:)` + `formatDoctorReport` | `runDoctor` + `formatDoctorReport` |
+| ack timeout (default 15 s; finite, > 0, ≤ 2^31−1 ms — else `ConfigError`) | `ackTimeoutMs` | `ack_timeout_s` | `AckTimeout` (`TimeSpan`) | `ackTimeoutMs` | `ackTimeout` (seconds) | `ackTimeout` (`Duration`) |
+
+Also in every language (snake_case in Python; PascalCase plus `Async` on awaitables in C#): `history(pattern?)`, `historyJSON(ch)`, `latestJSON(ch)`, `members()`, `listeners(ch)`, `sendTo(participantId, ch, v)`, `throttle(ch, hz)` (Swift and Dart: `hz:`), `me`, `diagnostics()`, `note(code, message, level)`, `ping()`. The JSON receive helpers silently skip values that are not valid JSON strings.
+
+### Lifecycle events per language
+
+| Event | TypeScript / Python | C# (.NET event) | Kotlin (`client.events`) | Swift (`client.events()`) | Dart (`onEvent`) |
+| --- | --- | --- | --- | --- | --- |
+| state changed | `'stateChange'` → state string | `StateChanged` (`string`) | `ClientEvent.StateChange(state)`, or collect `client.state` | `.stateChange(TransportState)` | `'stateChange'` → `String` |
+| error | `'error'` → `AdapterError` | `Error` (`AdapterError`) | `ClientEvent.Failure(error)` | `.failure(AdapterError)` | `'error'` → `AdapterError` |
+| someone joined | `'memberJoin'` → `Member` | `MemberJoined` (`Member`) | `ClientEvent.MemberJoin(member)` | `.memberJoin(Member)` | `'memberJoin'` → `Member` |
+| someone left | `'memberLeave'` → participant id | `MemberLeft` (`string`) | `ClientEvent.MemberLeave(participantId)` | `.memberLeave(String)` | `'memberLeave'` → `String` |
+| history re-seeded | `'history'` → messages | `HistoryReplaced` (`IReadOnlyList<StageMessage>`) | `ClientEvent.HistoryReplaced(history)` | `.historyReplaced([StageMessage])` | `'history'` → `List<StageMessage>` |
+| session over | `'ended'` → reason or none | `Ended` (`string?`) | `ClientEvent.Ended(reason)` | `.ended(String?)` | `'ended'` → `String?` |
+| offline queue dropped its oldest | `'queueOverflow'` → `PublishInput` | `QueueOverflow` | `ClientEvent.QueueOverflow(input)` | `.queueOverflow(PublishInput)` | `'queueOverflow'` |
+
+- Python uses the **same camelCase strings** as TypeScript (`"stateChange"`, not `"state_change"` — that would be a channel).
+- Kotlin `events` is a hot `SharedFlow` with no replay and a 256-event buffer that drops the oldest. Nothing can subscribe before `connect()` returns, so the `connected` transition is already gone: launch collectors with `start = CoroutineStart.UNDISPATCHED` right after `connect()` (subscribed before the next line runs) and read `client.state.value` / `history()` for what came before. One `launch` per collector — `collect` never returns. Swift: each `events()` stream sees only events after the call, buffers the newest 256 and finishes right after `.ended`. Dart: an unknown `onEvent` name silently never fires.
+- `ended` reasons (same strings everywhere): `client-closed` (you closed it); `rejoin-abandoned: <code>` (waiting cannot fix it — `AuthRevoked` when the key was revoked or expired, `ProtocolVersionMismatch`, `ClientAheadOfServer`, `ConfigError`, `ValidationError`); with `autoRejoin` off also the server's own reason, `room-ended`, `server-disconnect` (the server cut the connection) or `reauth-failed`. `ended` is final — build a new client to connect again.
+- There is no standby-change event: read `standby`, or watch for the `standby` / `active` codes in `diagnostics()` or the `onLog` sink.
+
+### Sessions and names
+
+- **Who starts a session.** An Editor or Owner opening the stage in Connect starts it; people who join through a share link cannot. The person who created the stage holds the session: when they close the stage, it ends about a minute later — even with programs connected. A key created with **Let adapters start a session** turned on (Share → Adapter keys — a key keeps the setting it was issued with) can start the session itself, and while such a key exists the creator is just another participant: the session stays open while anyone — person or program, the creator included — is connected and closes a few minutes (5 by default) after the last one leaves. Revoking the last such key — or its expiry, noticed within 15 s — while no Editor or Owner is connected ends the session about a minute later. Without such a key the session ends about a minute after its creator leaves (Editors still inside do not hold it), and a session an Editor opened without the creator ends about a minute after the last Editor leaves — programs connected or not.
+- **When a session ends under a connected client**, the client does not end: with `autoRejoin` (on by default) it reports `reconnecting`, queues sends and joins the next session. Pass `autoRejoin: false` for a one-shot script that should finish with the session. A revoked or expired key still ends it (`rejoin-abandoned: AuthRevoked`).
+- **`displayName`** (1–64 characters, default `Omni adapter`) is how the stage shows your program and how screen layers find it. Keep it stable — the participant id changes on every run. The same adapter key is never renamed — a restart keeps its name. Another **program** connected under the same name with a **different** key makes yours join as `name (2)`; for an adapter that joins with `providesView: 'stream'`, so does a name whose Adapter Stream layer is bound to another adapter key that is still valid — usually a rotated key whose old copy was never revoked: revoke it. Print `me.displayName` after connecting to see the name you got. A person who takes a program's name is the one renamed. (Older servers, from before same-key name sharing, renamed a restart that came within a few seconds of an unclean exit to `name (2)`.)
+- **One active instance per name (`exclusiveName: true`)**, for a failover pair. Both copies must use the **same adapter key**; the newest connection is active and the others are standby: standby keeps receiving, stops sending, and takes over when the active one leaves. A copy with a different key joins as `name (2)` and its `exclusiveName` is ignored. Leave it off for crowds that share a name on purpose.
+
+### Delivery: acks, offline queue, standby
+
+- **Fire-and-forget by default.** `ack: true` waits for the **server's** acknowledgement — not a peer's — and fails with `AckTimeout` after 15 s (configurable). A direct acked send still waiting when the connection closes or drops fails with `AckTimeout` at once (all six) and is not re-sent; a queued acked send stays in the queue and goes out again after the reconnect — so an `AckTimeout` never proves the server didn't get it. Queued acked sends fail with `SessionEnded` when the client ends. The same caution holds for a queued acked send that went out just before a drop and is later failed with `QueueOverflow`, `Standby` or `SessionEnded`: on a queued acked send, none of these codes proves the server missed it.
+- **Fire-and-forget is at-most-once — direct or queued.** It asks for no ack, so the adapter never learns that the server refused it (rate limit included), and a send lost to a drop right after it went out is not retried: nothing is thrown or recorded. Only acked sends see the server's answer: the call fails with the code (a direct acked send also leaves `send-dropped` in `diagnostics()`).
+- **60 messages a second per connection.** The server accepts at most 60 messages a second from one connection and silently drops fire-and-forget messages over that. The adapter mirrors the limit with a token bucket — 60 per second, bursts of up to 30 — on every send, direct or queued: with no token free, the send waits in the queue. A source that keeps sending faster than 60/s fills the queue; the oldest items are dropped (the queue-overflow event fires for each; `diagnostics()` notes `queue-overflow` once per episode, again only after the queue has drained to half its limit) and the newest value still gets through. The queue drains at 60 a second, so a full default queue (1000) takes about 17 s to empty — and after a disconnect a sender at 60/s or more stays that far behind (up to `queueLimit` ÷ 60 seconds): throttle the source or lower `queueLimit`. The burst of 30 absorbs about half a second of network clumping. Acked sends go one per round trip — never use `ack: true` for a high-rate stream.
+- **While disconnected, reconnecting or backing off**, sends queue (1000 by default; overflow drops the oldest as above and fails a dropped acked send with `QueueOverflow`) and flush in order once sending can resume, as fast as the bucket allows: fire-and-forget items go out without waiting for acks, an acked item waits for its server answer before the next one goes. A fire-and-forget send returns as soon as it is queued — **except in TypeScript**, where an awaited send that got queued resolves only when it is flushed (or dropped); do not `await` sends in a TypeScript sampling loop.
+- **`close()` drops queued fire-and-forget sends** (queued acked sends fail with `SessionEnded`). To be sure the last values went out, await an acked send or wait until `queuedCount` is 0 before closing. `replay()`/`simulate()` and the CLI's `replay`/`simulate` already wait for the queue to drain (giving up after 15 s without progress), and those CLI commands exit 1 if anything is still queued.
+- **`TooManyRequests`**, seen only on acked sends (the bucket makes it rare; `ensureStreamLayer()` throws it on a 429 — that one is yours to retry): the adapter backs off (1 s, doubling, up to 60 s) and re-queues silently — no `send-dropped`. You recognise it as: connected, `queuedCount > 0`, no `send-dropped`, not standby.
+- **Standby.** New sends while standby are dropped (fire-and-forget) or rejected with `Standby` (`ack: true`) — never deferred. When an instance **becomes** standby (after a reconnect or when presence changes), everything it had queued is dropped too: fire-and-forget discarded (the `standby` entry in `diagnostics()` ends with `— dropped N queued sends`), acked sends rejected with `Standby`. A later promotion therefore sends nothing stale. After each (re)connect with `exclusiveName`, the adapter needs one roster round trip to learn whether it is standby; sends made meanwhile are held (sharing `queueLimit`), then queued if this instance is active (or the judgment failed) or treated by the standby rule.
+- **`throttle(channel, hz)`** returns a push function that coalesces to at most `hz` sends per second (the last value wins). It validates the channel and value at the call and throws `ValidationError` for a bad one (a push after `close()` does not throw); delivery after that is fire-and-forget. There is no JSON variant — push the JSON string yourself (`JSON.stringify(obj)`).
+- **JSON helpers**: a value that cannot be encoded (a cycle, an unsupported type) fails the call with `ValidationError` (TypeScript: the returned promise rejects; elsewhere the call throws). `NaN`/`Infinity` are rejected the same way in five languages; TypeScript's `JSON.stringify` turns them into `null`.
+
+### latest and history
+
+- `history(pattern?)` is the server's replay ring (the last 1000 messages by default), re-seeded on every (re)join. It is not storage.
+- `latest(channel)` is the last value of each of the **1000 most recently updated channels**: seeded from the history snapshot, updated by live messages, and by your own sends once they go out (an acked send once the server acks it, a queued send when it is flushed). It is empty for a channel never seen, one pushed out by newer channels, or one missing from the snapshot after a reconnect.
+- **Callback order**: in all six languages callbacks run one at a time in arrival order. Swift skips the oldest message callbacks once 1000 are waiting (`latest()` stays exact; signaling and presence are never skipped). Python async callbacks start in arrival order but interleave after their first `await`.
+
+## TypeScript / JavaScript
+
+**Install** — from npm. ESM-only, Node 22+ or any bundler:
+
+```bash
+npm install @studioxid/omni-adapter   # package.json needs "type": "module"
+npx tsx main.ts                      # or compile with tsc first
+```
+
+From a checkout of the repository instead: build it once (`cd <repo>/typescript && pnpm install && pnpm build`) and install it with `npm install --install-links <repo>/typescript` — keep `--install-links`, or a React app ends up with two copies of React ("Invalid hook call").
+
+**A complete program** — connect, lifecycle, receive, send, exit cleanly:
+
+```ts
+import { connect, isAdapterError, runDoctor, formatDoctorReport, type ConnectClient } from '@studioxid/omni-adapter';
+
+const token = process.env.CONNECT_TOKEN ?? '';
+
+async function join(): Promise<ConnectClient> {
+  try {
+    return await connect({
+      secretKey: token,
+      displayName: 'line3-controller',          // what the stage shows; keep it stable
+      receives: ['door.state', 'robot.status'], // omit the field to declare nothing
+      sends: ['door.open', 'robot.target'],
+    });
+  } catch (err) {
+    if (!isAdapterError(err)) throw err;
+    console.error(`connect failed: ${err.code}: ${err.hint ?? err.message}`);
+    console.error(formatDoctorReport(await runDoctor(token)));   // names the broken step
+    process.exit(1);
+  }
+}
+
+const client = await join();
+console.log(`joined as ${client.me?.displayName}`);   // "line3-controller (2)" if the name was taken
+let timer: ReturnType<typeof setInterval> | undefined;
+const stop = async () => { clearInterval(timer); await client.close(); };   // then nothing holds Node open
+process.once('SIGINT', () => void stop());    // Ctrl+C
+process.once('SIGTERM', () => void stop());   // docker stop, systemd, kill
+
+// Lifecycle events are reserved names on the same on() (TypeScript and Python only).
+client.on('error', (err) => console.error(`adapter error ${err.code}: ${err.hint ?? err.message}`));
+client.on('stateChange', (state) => console.log(`state: ${state}`));
+client.on('ended', (reason) => {
+  if (reason === 'client-closed') return;      // our own close()
+  console.error(`session over: ${reason ?? 'ended'}`);
+  process.exitCode = 1;
+  void stop();
+});
+
+client.on('door.state', (msg) => console.log(`door.state = ${String(msg.value)}`));
+client.onJSON('robot.status', (value) => {     // value is unknown — cast it, or use typed channels
+  console.log((value as { pose: number[] }).pose);
+});
+
+try {
+  await client.send('door.open', true, { ack: true });   // resolves when the server acks
+} catch (err) {
+  if (!isAdapterError(err)) throw err;
+  const why = err.hint ?? err.message;   // AckTimeout carries neither a hint nor more than its code
+  console.error(`door.open failed: ${why === err.code ? err.code : `${err.code}: ${why}`}`);
+}
+// Un-awaited sends are fire-and-forget; attach a catch so a rejection is not unhandled.
+client.sendJSON('robot.target', { x: 0, y: 0 }).catch((err: unknown) => console.error(err));
+
+const pushTarget = client.throttle('robot.target', 20);   // at most 20 sends/s, last value wins
+timer = setInterval(() => pushTarget(JSON.stringify({ x: Math.random(), y: Math.random() })), 10);   // no throttleJSON
+```
+
+**Types.** `StageMessage` is `{ channel, value, sourceParticipantId, timestamp, messageId? }`; `timestamp` is the server's stamp in epoch milliseconds, comparable across machines. `latest(ch)` returns `string | number | boolean | null | undefined`; `latestJSON<T>(ch)` and `historyJSON<T>(ch)` take a type parameter (no runtime validation), `onJSON` does not — its value is `unknown`. Typed channels make the JSON helpers infer per channel: `connect<{ 'robot.status': Pose }>({ … })`. `members()` includes you. Unsubscribe functions are plain `() => void` (there is no `Unsubscribe` export). Other exports: `ConnectOptions`, `ConnectClient`, `Primitive`, `Member`, `Listeners`, `AdapterError`, `isAdapterError`, `LogEntry`, `LogLevel` (`'debug' | 'info' | 'warn' | 'error'`), `MemoryStage`, `replay`, `simulate`, `buildReport`, `measureLatency`, `startScreenBroadcast`.
+
+**Pitfalls**
+
+- **An open client keeps the Node process alive.** A long-running adapter needs nothing extra; a one-shot script must `await client.close()` or it never exits. After `await client.close()` (and with your own timers cleared) the process exits by itself; do not call `process.exit()` before `close()` has finished.
+- `close()` returns a `Promise<void>` that never rejects. The client ends at the call — later sends reject with `SessionEnded`, queued acked sends reject with `SessionEnded` right then, `ended` fires — and the promise settles once the server confirms the leave (at most about 1 s). Attach handlers to acked sends **before** `await client.close()`, or their rejection is unhandled. React cleanup: `return () => { void client.close(); };` (`() => () => client.close()` no longer type-checks with `@types/react` 19).
+- `send()`/`sendJSON()` return promises: await them or attach `.catch` — an un-awaited rejection is unhandled (Node's default ends the process). Validation errors (bad value, closed client) reject the returned promise.
+- Callbacks run on the event loop in arrival order; a long synchronous handler delays everything, ack replies included.
+- Options worth knowing: `exclusiveName`, `strictRouting`, `autoRejoin` (default `true`), `ackTimeoutMs`/`joinTimeoutMs` (15000), `transports: ['polling']` (proxies that block WebSocket), `onLog` (stream the diagnostics ring into your logger), `queueLimit`, `osHostname`.
+- In a browser page the token is visible to every visitor. For a page embedded in a stage use an Adapter View layer, which needs no credential ([Optional](#adapter-view-and-the-engine-profile)); otherwise use a token you are ready to revoke.
+
+**React** (`react` 18+ is an optional peer dependency). The provider connects on mount and closes on unmount; your own sends are not echoed into `useChannelJSON` — append them to local state.
+
+```tsx
+import { ConnectProvider, useConnect, useChannelJSON } from '@studioxid/omni-adapter/react';
+
+function Chat() {
+  const { client, state, error } = useConnect();   // client is null until joined
+  const messages = useChannelJSON<{ text: string }>('chat.message');   // history backlog + live
+  if (error) return <p>{error.hint ?? error.message}</p>;
+  return (
+    <div>
+      <p>{state}</p>
+      {messages.map((m, i) => <p key={i}>{m.text}</p>)}
+      <button onClick={() => void client?.sendJSON('chat.message', { text: 'hi' })}>send</button>
+    </div>
+  );
+}
+
+export const App = ({ token }: { token: string }) => (
+  <ConnectProvider secretKey={token} displayName="dashboard" receives={['chat.message']} sends={['chat.message']}>
+    <Chat />
+  </ConnectProvider>
+);
+```
+
+Other hooks: `useMembers`, `useLatest`, `useLatestJSON`, `useHistoryJSON`, `useChannelEvent`, `useThrottledSend`, `useConnectClient`.
+
+## Python
+
+**Install** — Python 3.10+:
+
+```bash
+pip install omni-adapter
+# from a checkout of the repository instead:  pip install <repo>/python
+```
+
+The module is `omni_adapter`; the same package installs the `omni-adapter` CLI (`python -m omni_adapter …` when the npm CLI of the same name is also on PATH).
+
+**A complete program** — a sensor bridge that also obeys a command channel:
+
+```python
+import asyncio
+import os
+import random
+import sys
+import time
+from typing import Optional
+
+import omni_adapter
+
+
+def read_sensor() -> float:  # stands in for a blocking hardware read
+    time.sleep(0.05)
+    return round(21.0 + random.uniform(-0.5, 0.5), 2)
+
+
+async def main() -> int:
+    token = os.environ.get("CONNECT_TOKEN", "")
+    try:
+        client = await omni_adapter.connect(
+            secret_key=token, display_name="line3-sensor",
+            receives=["hvac.setTemp"], sends=["sensor.temperature", "hvac.status"],
+        )
+    except omni_adapter.AdapterError as err:
+        print(f"connect failed: {err.code}: {err.hint or err.message}", file=sys.stderr)
+        print(omni_adapter.format_doctor_report(await omni_adapter.run_doctor(token)), file=sys.stderr)
+        return 1
+    print(f"joined as {client.me.display_name if client.me else '?'}")
+    stop, exit_code = asyncio.Event(), 0
+
+    # Lifecycle events: the SAME camelCase names as TypeScript, on the same on().
+    client.on("error", lambda err: print(f"adapter error {err.code}: {err.hint or err.message}", file=sys.stderr))
+    client.on("stateChange", lambda state: print(f"state: {state}"))
+
+    @client.on("ended")
+    def on_ended(reason: Optional[str]) -> None:
+        nonlocal exit_code
+        if reason != "client-closed":
+            print(f"session over: {reason}", file=sys.stderr)
+            exit_code = 1
+            stop.set()
+
+    @client.on("hvac.setTemp")  # async: may await client calls (a sync callback must not — see pitfalls)
+    async def on_set_temp(msg: omni_adapter.StageMessage) -> None:
+        print(f"hvac.setTemp = {msg.value!r}")
+        await client.send_json("hvac.status", {"target": msg.value, "ok": True})
+
+    push = client.throttle("sensor.temperature", 5)  # at most 5 sends/s, last value wins
+
+    async def sensor_loop() -> None:
+        while True:
+            push(await asyncio.to_thread(read_sensor))  # blocking I/O off the event loop
+            await asyncio.sleep(0.2)
+
+    task = asyncio.create_task(sensor_loop())
+    # Ctrl+C / SIGTERM → leave cleanly: the first signal sets `stop`, a second exits at once. Needed on
+    # Python 3.10 (asyncio.run would cancel the socket before `finally` runs); works on Windows too.
+    with omni_adapter.stop_on_signals(stop.set):
+        try:
+            await stop.wait()
+        finally:
+            task.cancel()
+            await client.close()  # leave the stage, so a restart keeps the name
+    return exit_code
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(asyncio.run(main()))
+    except KeyboardInterrupt:
+        pass
+```
+
+**Types.** `StageMessage` has `channel`, `value`, `source_participant_id`, `timestamp`, `message_id`; `Member` has `participant_id`, `display_name`, … (snake_case). `latest(ch)` returns `None` when unknown. `on(name, cb)` returns an unsubscribe function; the decorator form returns your function (remove it with `client.off(name, fn)`). `on_json` callbacks get `(value, msg)`. Options are snake_case keywords: `exclusive_name`, `strict_routing`, `auto_rejoin`, `ack_timeout_s`, `join_timeout_s`, `transports=["polling"]`, `on_log`, `queue_limit`, `os_hostname`.
+
+**Pitfalls**
+
+- **asyncio, one thread.** Callbacks run on the event loop in arrival order. A sync callback must not block (`time.sleep`, a blocking serial read) — it stalls every later message and ack. Blocking I/O belongs in `await asyncio.to_thread(...)`.
+- **A sync callback cannot await.** Calling `client.send(...)` there only creates a coroutine that never runs ("coroutine … was never awaited") — nothing is sent. Make the callback `async def` (the adapter runs it and keeps it alive), or `asyncio.create_task(...)` and keep a reference to the task.
+- **From another thread** (a serial reader, a GUI): `asyncio.run_coroutine_threadsafe(client.send(ch, v), loop)`.
+- `send`/`send_json` raise `ValidationError` for a bad value; `send_json` emits compact JSON and rejects `NaN`/`Infinity`.
+- **Ctrl+C without `stop_on_signals`** on Python 3.10: `asyncio.run` cancels the adapter's own tasks first, so the leave from `close()` never reaches the server and the name frees itself only a few seconds later (Python 3.11+ delivers it either way). A SIGTERM (`docker stop`, systemd) without a handler ends the process at once on every version. `with omni_adapter.stop_on_signals(stop.set):` fixes both (SIGTERM exists on POSIX only — Windows has Ctrl+C) and restores the previous handlers when the block ends; a second signal exits at once. After the first signal, a send already waiting for its ack keeps going until it settles (at most the ack timeout).
+
+## C# / .NET
+
+**Install** — netstandard2.0 + net8.0:
+
+```bash
+dotnet add package StudioXid.OmniAdapter --prerelease   # only beta versions are published so far
+```
+
+From a checkout of the repository instead, keep the checkout **outside** your project folder (inside it, the .NET SDK's default `**/*.cs` glob compiles the checkout's tests and Unity scripts into your app) and `dotnet add reference ../omni-adapter/csharp/src/StudioXid.OmniAdapter`.
+
+Namespace `StudioXid.OmniAdapter`. Unity: see the [Unity checklist](#unity).
+
+**A complete program** (`Program.cs`, a .NET 8 console app):
+
+```csharp
+using System.Runtime.InteropServices;
+using StudioXid.OmniAdapter;
+
+var token = Environment.GetEnvironmentVariable("CONNECT_TOKEN") ?? "";
+ConnectClient client;
+try
+{
+    client = await Connect.ToStageAsync(new ConnectOptions
+    {
+        SecretKey = token, DisplayName = "line3-panel",
+        Receives = new[] { "ui.mode", "robot.status", "panel.ping" },
+        Sends = new[] { "door.open", "panel.state" },
+    });
+}
+catch (AdapterError err)
+{
+    Console.Error.WriteLine($"connect failed: {err.Code}: {err.Hint ?? err.Message}");
+    Console.Error.WriteLine(Doctor.FormatReport(await Doctor.RunAsync(token)));
+    return 1;
+}
+Console.WriteLine($"joined as {client.Me?.DisplayName}");
+var stop = new TaskCompletionSource<string?>(TaskCreationOptions.RunContinuationsAsynchronously);   // null = we stop
+
+// Ctrl+C and SIGTERM → leave cleanly.
+Console.CancelKeyPress += (_, e) => { e.Cancel = true; stop.TrySetResult(null); };
+using var sigterm = PosixSignalRegistration.Create(PosixSignal.SIGTERM, ctx => { ctx.Cancel = true; stop.TrySetResult(null); });
+
+// Lifecycle: .NET events. client.On("error", …) would subscribe to a CHANNEL named "error".
+client.Error += err => Console.Error.WriteLine($"adapter error {err.Code}: {err.Hint ?? err.Message}");
+client.StateChanged += state => Console.WriteLine($"state: {state}");
+client.Ended += reason => stop.TrySetResult(reason ?? "ended");
+
+// Server events arrive on the socket receive thread, one at a time — never block here.
+client.On("ui.mode", msg => Console.WriteLine($"ui.mode = {msg.Value}"));
+client.OnJson<RobotStatus>("robot.status", (status, msg) => Console.WriteLine($"pose {string.Join(",", status.pose)}"));
+// An async handler is async void: catch inside it, or an escaping exception kills the process.
+client.On("panel.ping", async msg =>
+{
+    try { await client.SendAsync("panel.state", "pong", ack: true); }
+    catch (AdapterError e)
+    {
+        var why = e.Hint ?? e.Message;   // AckTimeout carries neither a hint nor more than its code
+        Console.Error.WriteLine("panel.state failed: " + (why == e.Code ? e.Code : e.Code + ": " + why));
+    }
+});
+
+try
+{
+    await client.SendAsync("door.open", true, ack: true);
+    await client.SendJsonAsync("panel.state", new { mode = "ready", screen = 1 });
+}
+catch (AdapterError err)
+{
+    var why = err.Hint ?? err.Message;
+    Console.Error.WriteLine("send failed: " + (why == err.Code ? err.Code : err.Code + ": " + why));
+}
+
+var ended = await stop.Task;
+await client.CloseAsync();   // leaves the stage (≤ 1 s); Dispose() does the same without waiting
+if (ended is null or "client-closed") return 0;
+Console.Error.WriteLine($"session over: {ended}");
+return 1;
+
+record RobotStatus(double[] pose);   // property names go on the wire as written (case-sensitive)
+```
+
+**Types.** `StageMessage` has `Channel`, `Value`, `SourceParticipantId`, `Timestamp`, `MessageId`. `Value` and `Latest(ch)` are `object?` holding a `string`, `double`, `long`, `bool` or `null`. `On` returns an `IDisposable` (dispose to unsubscribe); `OnJson<T>`, `LatestJson<T>` and `HistoryJson<T>` deserialize with System.Text.Json (the non-generic `OnJson` gives a `JsonElement`). `Throttle(ch, hz)` returns an `Action<object?>`. `MembersAsync()` includes you; `ListenersAsync(ch)` returns `Declared` and `Broadcast`; `Diagnostics()` is a method. Reading state — `Latest()`, `History()`, `State`, `QueuedCount` — is thread-safe, so a UI timer can poll it.
+
+**Pitfalls**
+
+- **Server events** (channel messages, history, presence, remote-input holder notices) run **one at a time on the socket receive thread**. Never block there: `.Result`, `.Wait()`, `GetAwaiter().GetResult()` or `Dispatcher.Invoke` on an adapter call fails with a false `AckTimeout` after 15 s (the server did accept it — a retry publishes twice), and a callback blocked past the server's heartbeat drops the connection.
+- **Lifecycle events may arrive on other threads** (the reconnect task, the thread that called `CloseAsync()`; `Dispose()` raises `Ended` synchronously on the caller's thread). Marshal UI work with `Dispatcher.BeginInvoke`/`InvokeAsync`, `SynchronizationContext.Post` or Unity's main-thread queue — never `Dispatcher.Invoke`.
+- **`async` lambdas are `async void`**: wrap the body in try/catch — an escaping exception crashes the process. `await` inside them is fine (the receive thread is released at the first `await`).
+- A handler that throws stops neither the adapter nor other handlers: it arrives on `Error` as `SubscriberError`. Subscribing outside a `strictRouting` declaration arrives as `StrictRoutingWarning`.
+- `SendAsync`/`SendJsonAsync` throw validation errors synchronously — keep them inside `try`, not only observed through the returned `Task`.
+- System.Text.Json keeps C# property names as written and matches case-sensitively: `record Target(double X)` sends `{"X":…}`. Use lowercase names (as above) or `[JsonPropertyName("x")]`.
+- If you pass `ConnectOptions.HttpClient`, give every client its own: clients sharing one cookie-enabled `HttpClient` join as the **same participant**, and closing one marks the other as left.
+- Options: `ExclusiveName`, `StrictRouting`, `AutoRejoin`, `AckTimeout`/`JoinTimeout` (`TimeSpan`), `UsePolling`, `OnLog`, `QueueLimit`, `OsHostname`.
+
+## Kotlin / JVM / Android
+
+**Install** — JVM 11+ target, from Maven Central (run Gradle on JDK 17–21). A complete consumer project (`settings.gradle.kts`, `app/build.gradle.kts`, the program in `app/src/main/kotlin/Main.kt`, run with `./gradlew run`); from a checkout of the repository instead, add `includeBuild("<repo>/kotlin")` to `settings.gradle.kts` and keep the same coordinates:
+
+```kotlin
+// settings.gradle.kts
+rootProject.name = "my-adapter"
+include("app")
+
+// app/build.gradle.kts
+plugins {
+    kotlin("jvm") version "2.1.0"
+    application
+}
+
+repositories {
+    mavenCentral()   // the adapter's own dependencies come from here
+}
+
+dependencies {
+    implementation("com.studioxid:omni-adapter:0.1.0-beta.1")
+}
+
+application {
+    mainClass = "MainKt"   // the class Kotlin makes from Main.kt
+}
+```
+
+**A complete program** (`Main.kt`):
+
+```kotlin
+import com.studioxid.omniadapter.*
+import kotlinx.coroutines.*
+import org.json.JSONObject
+import kotlin.system.exitProcess
+
+fun main(): Unit = runBlocking {
+    val token = System.getenv("CONNECT_TOKEN") ?: ""
+    val client = try {
+        connect(ConnectOptions(
+            secretKey = token, displayName = "lobby-kiosk",
+            receives = listOf("kiosk.cmd", "robot.status"), sends = listOf("kiosk.status"),
+        ))
+    } catch (err: AdapterError) {
+        System.err.println("connect failed: ${err.code}: ${err.hint ?: err.message}")
+        System.err.println(formatDoctorReport(runDoctor(token)))
+        exitProcess(1)
+    }
+    println("joined as ${client.me?.displayName}")
+    // Ctrl+C and SIGTERM both run shutdown hooks: leave the stage cleanly.
+    Runtime.getRuntime().addShutdownHook(Thread { runBlocking { client.close() } })
+
+    // Lifecycle: client.events (no replay) — NOT client.on("error"), which is a channel.
+    // UNDISPATCHED subscribes before launch returns; one launch per collector (collect never returns).
+    val ended = CompletableDeferred<String?>()
+    val lifecycle = launch(start = CoroutineStart.UNDISPATCHED) {
+        client.events.collect { event ->
+            when (event) {
+                is ClientEvent.Failure -> System.err.println("adapter error ${event.error.code}: ${event.error.hint ?: event.error.message}")
+                is ClientEvent.StateChange -> println("state: ${event.state}")
+                is ClientEvent.Ended -> ended.complete(event.reason)
+                else -> Unit
+            }
+        }
+    }
+
+    // Callbacks run on socket.io's event thread: never runBlocking a client call here — launch it.
+    client.on("kiosk.cmd") { msg ->
+        launch {
+            try { client.send("kiosk.status", "done: ${msg.value}", ack = true) }
+            catch (err: AdapterError) {
+                val why = err.hint ?: err.message   // AckTimeout carries neither a hint nor more than its code
+                System.err.println("kiosk.status failed: ${if (why == err.code) err.code else "${err.code}: $why"}")
+            }
+        }
+    }
+    client.onJson("robot.status") { value, _ -> println("pose: ${(value as? JSONObject)?.optJSONArray("pose")}") }
+    try {
+        client.sendJson("kiosk.status", mapOf("ready" to true, "screen" to 1))  // Map/List/JSONObject/JSONArray — not a data class
+    } catch (err: AdapterError) {
+        val why = err.hint ?: err.message
+        System.err.println("send failed: ${if (why == err.code) err.code else "${err.code}: $why"}")
+    }
+
+    val reason = ended.await()   // until the session is over, or close() from the hook
+    lifecycle.cancel()
+    if (reason != "client-closed") {
+        System.err.println("session over: $reason")
+        exitProcess(1)
+    }
+}
+```
+
+**Types.** `StageMessage` has `channel`, `value`, `sourceParticipantId`, `timestamp`, `messageId`. `value` and `latest(ch)` are `Any?` (`String`, a `Number`, `Boolean` or `null`); `onJson`, `latestJson` and `historyJson` give `JSONObject`/`JSONArray`/primitives (org.json) — no type parameter. `on` returns a `Closeable`. `throttle(ch, hz)` takes a `Double` and returns `(Any?) -> Unit`. `members()`, `listeners(ch)` and `close()` are suspend functions; `state` is a `StateFlow<String>` (`client.state.value`), `standby` and `queuedCount` are plain properties.
+
+**Pitfalls**
+
+- **Callbacks run on socket.io's event thread.** `runBlocking { client.send(…, ack = true) }` there waits for an ack that this very thread must read — it fails with `AckTimeout`. `launch` it instead, and catch inside the launched coroutine (an uncaught `AdapterError` cancels its parent scope).
+- **Android**: connect in `lifecycleScope` (never `runBlocking` on the main thread), switch to `Dispatchers.Main` before touching views, add the `INTERNET` permission, and allow cleartext traffic for a plain-`http://` server.
+- **JVM lifetime**: a live client keeps the JVM running (while connected and while reconnecting), so a long-running adapter needs nothing extra. It lets go after `close()`, a terminal `Ended`, or a failed `connect()`. `dispose()` alone does not end the client — it only cancels its coroutines; call `close()` first.
+- `close()` ends the client at the call, sends the leave and waits for the server's confirmation (at most 1 s), so it is safe in a shutdown hook (the JVM then exits with 130/143, the usual signal codes). Called from inside a channel callback it sends the leave without waiting. Each client is its own participant: the join ignores an app-wide `CookieHandler`.
+- A `state`/`events` collector on `Dispatchers.Unconfined` runs on the thread that made the transition — usually that same event thread — so the callback rule applies there too: never `runBlocking` a client call that waits for the server (`runBlocking { client.send(…, ack = true) }` fails with `AckTimeout`); launch it, or collect on a real dispatcher.
+- `sendJson` accepts `Map`, `List`/`Collection`, `JSONObject`, `JSONArray`, strings, numbers, booleans and `null`; anything else (a data class) throws `ValidationError`.
+- Options: `exclusiveName`, `strictRouting`, `autoRejoin`, `ackTimeoutMs`/`joinTimeoutMs`, `usePolling`, `onLog`, `queueLimit`, `osHostname`.
+
+## Swift
+
+**Install** — Swift 5.9+, iOS 13+/macOS 10.15+; SwiftPM resolves the public mirror repository `ProtoPie/omni-adapter-swift` (each release copies `swift/` there and tags it `X.Y.Z`). From a checkout of the main repository instead: `.package(path: "<repo>/swift")` with `package: "swift"` (a path dependency's identity is the folder name):
+
+```swift
+// swift-tools-version:5.9
+import PackageDescription
+
+let package = Package(
+    name: "MyAdapter",
+    platforms: [.macOS(.v10_15), .iOS(.v13)],            // required
+    dependencies: [.package(url: "https://github.com/ProtoPie/omni-adapter-swift", from: "0.1.0-beta.1")],
+    targets: [
+        .executableTarget(name: "MyAdapter", dependencies: [
+            .product(name: "OmniAdapter", package: "omni-adapter-swift"),   // package = the repository name
+        ]),
+    ]
+)
+```
+
+**A complete program** (`Sources/MyAdapter/main.swift`):
+
+```swift
+import OmniAdapter
+import Foundation
+
+let token = ProcessInfo.processInfo.environment["CONNECT_TOKEN"] ?? ""
+let client: ConnectClient
+do {
+    client = try await connect(ConnectOptions(   // argument order is fixed by the initializer
+        secretKey: token,
+        displayName: "ipad-wall",
+        receives: ["wall.mode", "robot.status"],
+        sends: ["wall.status"]
+    ))
+} catch let err as AdapterError {
+    print("connect failed: \(err.code): \(err.hint ?? err.message)")
+    print(formatDoctorReport(await runDoctor(credential: token)))
+    exit(1)
+}
+print("joined as \(await client.me?.displayName ?? "?")")
+
+// Ctrl+C and SIGTERM → leave cleanly (the events() loop below then sees .ended("client-closed")).
+var signalSources: [DispatchSourceSignal] = []
+for sig in [SIGINT, SIGTERM] {
+    signal(sig, SIG_IGN)
+    let source = DispatchSource.makeSignalSource(signal: sig, queue: .main)
+    source.setEventHandler { Task { await client.close() } }
+    source.resume()
+    signalSources.append(source)
+}
+
+// Channel callbacks are synchronous, off the main actor, in arrival order.
+await client.on("wall.mode") { message in
+    print("wall.mode = \(message.value.stringValue ?? "-")")   // print(message.value) shows string("…")
+}
+await client.onJSON("robot.status") { value, _ in   // value: [String: Any], [Any], String, NSNumber…
+    if let status = value as? [String: Any], let pose = status["pose"] as? [Double] { print("pose: \(pose)") }
+}
+
+let brightness = 0.8
+do {
+    try await client.send("wall.status", "ready", ack: true)
+    try await client.send("wall.status", .double(brightness))   // variables need the enum case
+    try await client.sendJSON("wall.status", ["screen": 1, "on": true])
+} catch let err as AdapterError {
+    let why = err.hint ?? err.message   // AckTimeout carries neither a hint nor more than its code
+    print("send failed: \(why == err.code ? err.code : "\(err.code): \(why)")")
+}
+
+// Lifecycle: client.events() — NOT client.on("error"), which is a channel.
+for await event in await client.events() {
+    switch event {
+    case .failure(let err): print("adapter error \(err.code): \(err.hint ?? err.message)")
+    case .stateChange(let state): print("state: \(state.rawValue)")
+    case .ended(let reason):                                    // the last event
+        await client.close()   // lets the leave started by the signal handler finish (a no-op otherwise)
+        if reason != "client-closed" { print("session over: \(reason ?? "ended")") }
+        exit(reason == "client-closed" ? 0 : 1)
+    default: break
+    }
+}
+```
+
+**Types.** `StageMessage` has `channel`, `value`, `sourceParticipantId`, `timestamp`, `messageId`. `value` and `latest(ch)` are the `Primitive` enum (`.string`, `.int`, `.double`, `.bool`, `.null`): read with `.stringValue`/`.doubleValue`/`.boolValue`/`.jsonValue` (interpolating the raw value prints `string("go")`); literals convert automatically, variables need the case (`.double(x)`). A prototype's value arrives as `.string("42")` — `.doubleValue` is `nil` for it; parse with `Double(value.stringValue ?? "")`. `onJSON`, `latestJSON` and `historyJSON` give `Any` (`JSONSerialization` types; a JSON `null` arrives as `NSNull`). `on` returns a `Subscription` — it is **not** cancelled on deinit; call `cancel()`. `throttle(ch, hz:)` returns a synchronous `(Primitive) throws -> Void` — call it with `try push(.double(x))`; it checks the channel there (the value is already type-safe). `members()` and `listeners(ch)` are `async throws`; `state` is a `TransportState` enum (`.rawValue` for the string).
+
+**Pitfalls**
+
+- `ConnectClient` is an `actor`: every call is `await`ed (`try await` where it throws), properties included (`await client.standby`). `close()` ends the client at the call and waits up to 1 s for the leave to be confirmed. Each client carries its own guest cookie, so two clients in one app are two participants.
+- **Callbacks are synchronous, off the main actor, in arrival order.** Hop to UI with `Task { @MainActor in … }` (you cannot `await MainActor.run` inside a synchronous callback); hand heavy work to a `Task` — a slow callback delays the ones behind it. Past 1000 waiting messages the oldest skip their callback (`latest()` stays exact; the ring records `queue-overflow` with `inbound:`).
+- `ConnectOptions(...)` takes its arguments in initializer order (`secretKey, url, stageId, displayName, osHostname, receives, sends, providesView, strictRouting`). Set the rest as properties: `var options = ConnectOptions(secretKey: token); options.exclusiveName = true` (also `autoRejoin`, `ackTimeout`, `joinTimeout`, `usePolling`, `onLog`, `queueLimit`).
+- `sendJSON` takes what `JSONSerialization` can encode (`[String: Any]`, `[Any]`, strings, numbers, booleans); anything else throws `ValidationError`.
+- Apps: a plain-`http://` server addressed by host name needs an App Transport Security exception (the join's HTTP request goes through `URLSession`; a command-line tool is not affected); a sandboxed macOS app needs the `com.apple.security.network.client` entitlement. `throttle(hz:)` with `hz <= 0` traps (precondition); the other languages throw `ConfigError`.
+
+## Dart / Flutter
+
+**Install** — Dart 3.4+, Flutter incl. web; `dart pub add omni_adapter` (Flutter: `flutter pub add omni_adapter`), or in `pubspec.yaml`:
+
+```yaml
+dependencies:
+  omni_adapter: ^0.1.0-beta.1   # beta only so far; ^0.1.0 does not match a prerelease
+  # from a checkout of the repository instead:  omni_adapter: {path: <repo>/dart}
+```
+
+**A complete program** (`bin/main.dart`, Dart VM):
+
+```dart
+import 'dart:async';
+import 'dart:io';
+
+import 'package:omni_adapter/omni_adapter.dart';
+
+Future<void> main() async {
+  final token = Platform.environment['CONNECT_TOKEN'] ?? '';
+  final ConnectClient client;
+  try {
+    client = await connect(ConnectOptions(
+      secretKey: token,
+      displayName: 'line3-monitor',
+      receives: const ['line3.temp', 'robot.status'],
+      sends: const ['line3.ack'],
+    ));
+  } on AdapterError catch (err) {
+    stderr.writeln('connect failed: ${err.code}: ${err.hint ?? err.message}');
+    stderr.writeln(formatDoctorReport(await runDoctor(token)));
+    exit(1);
+  }
+  print('joined as ${client.me?.displayName}');
+  // Ctrl+C and SIGTERM → leave cleanly (SIGTERM cannot be watched on Windows).
+  final signals = [
+    ProcessSignal.sigint,
+    if (!Platform.isWindows) ProcessSignal.sigterm,
+  ].map((s) => s.watch().listen((_) => client.close())).toList();
+
+  // Lifecycle: onEvent(name, …) — NOT on('error'), which is a channel. Payloads are Object?.
+  final ended = Completer<String?>();
+  client.onEvent('error', (e) {
+    final err = e as AdapterError;
+    stderr.writeln('adapter error ${err.code}: ${err.hint ?? err.message}');
+  });
+  client.onEvent('stateChange', (state) => print('state: $state')); // a String
+  client.onEvent('memberJoin', (m) => print('+ ${(m as Member).displayName}'));
+  client.onEvent('memberLeave', (participantId) => print('- $participantId'));
+  client.onEvent('ended', (reason) {
+    if (!ended.isCompleted) ended.complete(reason as String?);
+  });
+
+  client.on('line3.*', (msg) => print('${msg.channel} = ${msg.value}'));
+  // value: the decoded JSON — Map, List, num, String, bool or null.
+  client.onJson('robot.status', (value) => print('status: $value'));
+
+  try {
+    // send/sendJson throw validation errors SYNCHRONOUSLY — keep them inside try.
+    await client.send('line3.ack', true, ack: true);
+    await client.sendJson('line3.ack', {'ok': true, 'count': 1});
+  } on AdapterError catch (err) {
+    final why = err.hint ?? err.message; // AckTimeout carries neither a hint nor more than its code
+    stderr.writeln('send failed: ${why == err.code ? err.code : '${err.code}: $why'}');
+  }
+
+  final reason = await ended.future;
+  for (final s in signals) {
+    await s.cancel();
+  }
+  if (reason != 'client-closed') {
+    stderr.writeln('session over: $reason');
+    exit(1);
+  }
+}
+```
+
+**In a Flutter widget:**
+
+```dart
+import 'dart:async';
+
+import 'package:omni_adapter/omni_adapter.dart';
+import 'package:flutter/material.dart';
+
+class Panel extends StatefulWidget {
+  const Panel({super.key});
+  @override
+  State<Panel> createState() => _PanelState();
+}
+
+class _PanelState extends State<Panel> {
+  // --dart-define=CONNECT_TOKEN=cst_… — compiled into the app (see pitfalls).
+  static const _token = String.fromEnvironment('CONNECT_TOKEN');
+  ConnectClient? _client;
+  String _text = 'connecting…';
+
+  @override
+  void initState() {
+    super.initState();
+    unawaited(_join());
+  }
+
+  Future<void> _join() async {
+    try {
+      final client = await connect(ConnectOptions(
+          secretKey: _token,
+          displayName: 'flutter-panel',
+          receives: const ['panel.value']));
+      if (!mounted) {
+        unawaited(client.close()); // the widget went away while connecting: free the seat
+        return;
+      }
+      _client = client;
+      client.on('panel.value', (msg) {
+        if (mounted) setState(() => _text = '${msg.value}');
+      });
+    } on AdapterError catch (err) {
+      if (mounted) setState(() => _text = err.hint ?? err.message);
+    }
+  }
+
+  @override
+  void dispose() {
+    unawaited(_client?.close()); // dispose() is synchronous: never await here
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => Text(_text);
+}
+```
+
+**Types.** `StageMessage` has `channel`, `value`, `sourceParticipantId`, `timestamp`, `messageId`; `value` and `latest(ch)` are `Object?` (`Primitive` is a typedef for it, so a non-primitive compiles and then throws `ValidationError`). `on` and `onEvent` return an unsubscribe function; lifecycle payloads are `Object?` — cast them (`e as AdapterError`, `m as Member`). `state` is a `TransportState` enum, while the `stateChange` payload is its name as a `String`. `throttle(ch, hz: 10)`.
+
+**Pitfalls**
+
+- **`send`/`sendJson` throw validation errors (bad value, closed client, unencodable JSON) synchronously** — not as a `Future` error: `catchError` and `unawaited` do not catch them. Call them inside `try`.
+- Callbacks run synchronously in the zone you called `connect()` from; heavy work in one janks the UI.
+- **Flutter tokens**: `--dart-define=CONNECT_TOKEN=cst_…` values are **compiled into the app** (in a Flutter web build they are plain text in `main.dart.js`, readable by every visitor) — use a token you are ready to revoke. Read it with `const String.fromEnvironment('CONNECT_TOKEN')`; never `Platform.environment` (dart:io) on the web.
+- `dispose()` is synchronous: `unawaited(_client?.close());` then `super.dispose()`. Guard `setState` after any `await` with `mounted`, and close a client whose `connect` finished after `dispose()` (`!mounted` right after the `await`) — both shown above.
+- Platforms: a sandboxed macOS app (Flutter macOS included) needs the `com.apple.security.network.client` entitlement; Android needs `INTERNET`. On native platforms the adapter uses `dart:io` sockets, which App Transport Security does not govern — a macOS build reached a plain-`http://` host with no exception (not verified on iOS). `usePolling: true` works on Flutter web only.
+- `osHostname` is filled in automatically on the Dart VM (the only language that does). Options: `exclusiveName`, `strictRouting`, `autoRejoin`, `ackTimeout`/`joinTimeout` (`Duration`), `onLog`, `logger`, `queueLimit`.
+
+## Errors and troubleshooting
+
+Every failure is an `AdapterError` with a stable `code` (branch on it), a `message`, and usually a `hint` — a one-line next step. Print the code and the hint, falling back to the message: TS/Swift/Dart `err.hint ?? err.message` · Python `err.hint or err.message` · C# `err.Hint ?? err.Message` · Kotlin `err.hint ?: err.message`. When an error has no message of its own, the message is the code itself (`AckTimeout` prints as `AckTimeout`) — so also say which call failed, as the programs above do. Errors throw from the call that caused them; errors that happen later arrive on the error event.
+
+| Code | Meaning | What to do |
+| --- | --- | --- |
+| `ConfigError` | Bad options or credential, before any network call: unset or empty token, whitespace around it, a bare `ck_` without `url`/`stageId`, an empty `receives`/`sends` list | Follow the hint. Bare `ck_`: use the `cst_` token instead |
+| `RoomEnded` | No live session | `connect()` fails with it at once. Open the stage in Connect, or use a key created with **Let adapters start a session** turned on (Share → Adapter keys — a key keeps the setting it was issued with) so it can start one. After a successful join, a session that closes is waited out by `autoRejoin` instead |
+| `AuthRevoked` | Key revoked or expired, or issued for another stage or server — or the stage is closed to guests (`stage-locked`) | Create a new key. Stage locked: adapters join as guests; ask the stage owner or whoever runs your Connect to reopen the stage to guests |
+| `StageFull` | Participant cap reached (each connection is one seat) | Stop clients you do not need; reuse one client |
+| `StageArchived` | The stage is archived | Ask an Editor or Owner to restore it |
+| `NotConnected` | Server unreachable — or `members()`/`listeners()` called while the client is not connected (reconnecting, closing), or `ensureStreamLayer()` got a server error (5xx) or no answer within the ack timeout | Check the network or VPN; re-copy the token if the server moved. From a roster call or `ping()`, the hint names the case: not joined yet (wait for connect), reconnecting (call again once `connected`, then re-read `members()`), or ended (create a new client) |
+| `JoinTimeout` | Reached the server, never admitted — often a proxy blocking WebSocket | Force long-polling: TS `transports: ['polling']` · Python `transports=["polling"]` · C# `UsePolling = true` · Kotlin/Swift `usePolling = true` · Dart `usePolling: true` (Flutter web only) |
+| `ProtocolVersionMismatch` / `ClientAheadOfServer` | Adapter and server speak incompatible protocol versions | Update the older side |
+| `ValidationError` | A bad channel or value (from the call), or the server rejected the join body (usually a version skew; the message names the fields) | Fix the value; for a join rejection update the older side |
+| `SessionEnded` | The client was closed or the session is over (a queued acked send that already went out once before a drop may still have reached the server) | Build a new client |
+| `AckTimeout` | No server ack within the ack timeout | The server may still have the message — do not blindly retry |
+| `Standby` | An `ack: true` send while another instance of an `exclusiveName` is active, or a queued acked send discarded when this instance became standby (which the server may already have, if it went out once before a drop) | Expected for a standby copy |
+| `QueueOverflow` | The full queue dropped this acked send (oldest first) — if it had already gone out once before a drop, the server may still have it | Send less — under 60 messages a second, and less while disconnected — or change `queueLimit` |
+| `TooManyRequests` | The server's rate limit (60 messages a second per connection), seen on acked sends — and thrown by `ensureStreamLayer()` on a 429, and by `connect()` when the server refuses the join: too many failed join attempts from this network address (20 within 5 minutes — usually another program here still using a revoked or mistyped token), or more than 60 joins a minute with one adapter key (a restart loop); servers without the per-key join limit also refuse a sixth join from one address within a minute. From `connect()` the error carries `retryAfterMs` — the server's remaining window: up to 5 minutes for the address cap, up to 60 s for the per-key limit, 1 s when the server is validating more than 200 joins at once — and the hint says the seconds; while rejoining, the adapter waits at least that long before the next attempt | Sends: nothing — the adapter backs off and re-sends from the queue by itself (not thrown); coalesce high-rate sources with `throttle()`. `ensureStreamLayer()`: retry later. `connect()`: not retried — wait up to 5 minutes and fix the program with the old token |
+| `KeyMaterialUnavailable` | `connect()` only (503): the server cannot read the stored material of an adapter key on the stage — a server-side key change left it behind. Each such attempt alone fails with a plain 500 (`Internal`, no hint); after 30 of them from one address within a minute for one stage every key — a correct one too — gets this 503 until the minute ends. The error carries `retryAfterMs` (the rest of that minute) | `connect()`: not retried — the hint says what to ask of whoever runs your Connect (revoke the stage's old keys or restore the key material); a joined client keeps retrying while it rejoins, waiting at least `retryAfterMs` |
+| `Unauthorized` · `NotSupported` | The server refused a roster request (for example this connection was already marked as left) · the call is not available here (a remote-input registration on the Engine profile, `ensureStreamLayer()` on a server without the route — its other errors are listed under the screen broadcast section) | Reconnect with a fresh client · check `docs/COMPATIBILITY.md` and the hint |
+| `SubscriberError` · `StrictRoutingWarning` | On the error event: one of your handlers threw (C#, Kotlin; elsewhere it is logged) · a subscription outside the `strictRouting` declaration (C#, Kotlin, Swift; TS/Python/Dart log a warning) | Fix the handler · the declaration |
+
+### Doctor
+
+Run it before debugging code — it checks the token, the URL shape, the server, screen and remote-input support, the live session and a real join, and names the failing step with a fix. Only `✖` lines need fixing; `△` and `·` are information. It diagnoses a `cst_` token (wrap a bare `ck_` key, or use the issued token). It also tells a server that takes no adapters at all (a Connect without the Omni package — `/api/about` says `capabilities.adapterGuest: false`) from a revoked key, and warns when the key inside the token is not 46 characters long (a truncated or altered copy — such a key is refused with a 401, and `connect()`'s hint says the same).
+
+```bash
+npx --no-install omni-adapter doctor "$CONNECT_TOKEN"   # in a Node project that installed the adapter
+omni-adapter doctor "$CONNECT_TOKEN"                    # Python environment (or: python -m omni_adapter doctor …)
+omni-adapter doctor "$CONNECT_TOKEN" --json             # CheckResult[] for scripts; exit code 1 if any check failed
+```
+
+Every language also has it as a library call (see the [name map](#name-map)); each complete program above prints the report when `connect` fails.
+
+### Connected but nothing happens
+
+1. Still connected, backlog empty? Read `state` and `queuedCount`. A backlog while `connected` means sending is held back: you send faster than 60 messages a second (`queue-overflow` in the ring once it is full), or a `TooManyRequests` backoff (no `send-dropped` in the ring, not standby), or the server is not acking a queued acked send (nothing is recorded for that; the adapter keeps the item and retries it by itself). A fire-and-forget send the server refuses — direct or queued — leaves no trace at all; send with `ack: true` while you debug.
+2. Read `diagnostics()` — the last 100 lifecycle points, recorded even if you subscribed to nothing.
+3. Does anyone receive the channel? Call `listeners(channel)` once: `declared` and `broadcast` both empty means nobody does — a typo, or the peer is not up. `declared` empty but `broadcast` non-empty is normal when the receiver is a prototype (prototypes never declare).
+4. With `strictRouting: true`, only exact declared `receives` arrive.
+5. Watch the channel from a second connection: `omni-adapter watch "$CONNECT_TOKEN" 'line3.*' --count 1 --timeout 5`. It exits 0 even when nothing arrived — count its output lines to judge liveness.
+6. Your own messages never come back to you (no self-echo) — test with a second client or the Console.
+
+## Roster, diagnostics, testing, CLI
+
+**Roster.** `members()` returns everyone in the session, **including you**. Presence is event-driven: use the join/leave events instead of polling — but **re-read `members()` after every (re)connect** (when the state becomes `connected`): joins and leaves that happened while you were disconnected are not replayed as events. A `Member` has `participantId` (don't store it — it can change when the client rejoins, e.g. after the server's guest token expires; `me` always holds your current one, updated before each `connected`) and `displayName` (the stable name), plus optional fields that are **absent** when not declared or on older servers: `clientType` (`'adapter'` = this library, `'player'` = a ProtoPie player, absent = a browser), `receives`/`sends` (absent = declared nothing, not "deaf"), `strictRouting`, `exclusiveName`, `standby` (absent = active), `osHostname` (which machine — set it yourself, automatic only on the Dart VM; blank values are dropped) and `providesView` (`'none' | 'web' | 'stream'`). Python uses snake_case fields, C# PascalCase. `listeners(channel)` takes an exact channel name and returns `{ channel, declared, broadcast }` — two lists of `Member`: those whose `receives` match, and those that receive it without declaring it — you excluded. It costs one `members()` round trip — call it at wiring time or from a diagnostics screen, not per message. Both are server round trips and reject with `NotConnected` while the client is not connected (reconnecting, or closing) — call them on `connected`. Signatures: TS `await client.members()` → `Member[]`, `await client.listeners(ch)` → `Listeners`; Python `await client.members()` → `list[Member]`, `await client.listeners(ch)` → `Listeners` (`declared`/`broadcast` are tuples); C# `await client.MembersAsync()` → `IReadOnlyList<Member>`, `await client.ListenersAsync(ch)` → `Listeners` (`Declared`/`Broadcast`); Kotlin `client.members()` → `List<Member>`, `client.listeners(ch)` → `Listeners` (both suspend); Swift `try await client.members()` → `[Member]`, `try await client.listeners(ch)` → `Listeners`; Dart `await client.members()` → `List<Member>`, `await client.listeners(ch)` → `Listeners`. The roster says a socket is joined, not that the peer's process is doing its job: for liveness, have the peer publish a periodic tick and watch it.
+
+**Diagnostics ring.** `diagnostics()` returns the last 100 entries `{ at, level, code, message }`, recorded with no setup and never containing a credential. Stream them into your logger with the `onLog` option; add your own marks with `note(code, message, level)`.
+
+**Console output by default.** TypeScript prints warnings and errors to the console as `[omni-adapter] …` (debug lines only with `debug: true`); pass `logger: (level, message) => …` to redirect them, or `logger: () => {}` to silence them. Python logs through the standard `logging` logger `omni_adapter` — its warnings reach stderr until you configure logging (`logging.getLogger("omni_adapter").setLevel(logging.ERROR)` quiets it). Dart prints every line, debug included, as `[omni-adapter] …` unless you pass `logger: (level, message) {}`. C#, Kotlin and Swift print nothing — use `OnLog`/`onLog` or read `diagnostics()`.
+
+| code | meaning |
+| --- | --- |
+| `state` · `ended` · `error` | state change · session over (with reason) · server or transport error (recorded even with no subscriber) |
+| `send-dropped` | the server rejected an acked send; fire-and-forget sends (direct or queued) are never acknowledged, so their rejection is not seen |
+| `queue-overflow` | the queue is full and drops its oldest items — noted once per episode, again only after it drained to half its limit (Swift also: `inbound:` skipped callbacks) |
+| `standby` · `active` | exclusiveName judgment changed (`— dropped N queued sends` when becoming standby discarded the queue) |
+| `no-listener` | written only by a `listeners()` call when nobody declared the channel — `warn` if nobody receives it at all, `info` if undeclared receivers exist |
+| `input-channel` · `hello` · `input-dropped` | remote input (see Optional) |
+| `engine-channels` | Adapter View: a declared channel is outside the layer's channel list |
+
+**Testing without a server — `MemoryStage`** (all six): an in-process stage with the same rules (no self-echo, strict routing, history re-seed on join and reconnect, exclusiveName judgment); no credential, no doctor, no screens, and no 60-messages-a-second limit (its transport sets `bypassRateLimit` — `bypass_rate_limit` in Python, `IRateLimitBypassTransport` in C#; Dart's client recognises `MemoryTransport` itself).
+
+```ts
+import { MemoryStage } from '@studioxid/omni-adapter';
+
+export async function aTriggersB(): Promise<number[]> {
+  const stage = new MemoryStage();   // options: roomId, historyLimit, rejectPublish (failure injection), now
+  const sensor = await stage.join({ displayName: 'line-sensor', sends: ['line.temp'] });
+  const alarm = await stage.join({ displayName: 'alarm-panel', receives: ['line.temp'], strictRouting: true });
+  const seen: number[] = [];
+  alarm.on('line.temp', (msg) => seen.push(Number(msg.value)));
+  await sensor.send('line.temp', 91);           // A triggers B
+  stage.inject('line.temp', 42);                // as if a prototype sent it
+  await new Promise((r) => setTimeout(r, 0));   // delivery lands on the next tick
+  stage.disconnect(alarm); stage.reconnect(alarm);   // reproduce a drop
+  stage.end();                                  // everyone gets 'ended'
+  return seen;                                  // [91, 42]
+}
+```
+
+Names: TS `stage.join({ … })`; Python `await stage.join(display_name=…)`; Kotlin `stage.join(MemoryJoinOptions(…))`; Swift `try await stage.join(MemoryJoinOptions(…))`; Dart `await stage.join(MemoryJoinOptions(…))`; C# `await stage.JoinAsync(new MemoryJoinOptions { … })`.
+
+**Testing without hardware** (all six): `replay(client, parseRecording(text), { speed: 2, loop: 1 })` re-publishes a recording (the NDJSON that `omni-adapter record`/`watch` write) with its original gaps ÷ `speed`; `simulate(client, 'line.temp', { waveform: 'sine', min: 18, max: 26, hz: 2, durationMs: 30_000 })` emits synthetic values (`'sine' | 'ramp' | 'random' | 'step'`). Both publish through `send()` — rate limit, queue, standby and backoff rules apply — wait for the queue to drain (giving up after 15 s without progress) before returning, stop on `ended` or when cancelled, and return the partial count.
+
+**Latency and repro bundles.** `ping()` times one server round trip without publishing anything; `measureLatency` gives min/p50/p95/max over 10 samples — adapter↔server only, not end-to-end (TS/Python `measureLatency(client)` / `measure_latency(client)`; Kotlin `measureLatency({ client.ping() })`; Swift `try await measureLatency(ping: { try await client.ping() })`; Dart `measureLatency(client.ping)`; C# `Latency.MeasureAsync(client.PingAsync)`). A repro bundle carries diagnostics, doctor results and the server's version info with only a fingerprint of the credential — pass the live client's diagnostics or its list stays empty: TS `buildReport(credential, { diagnostics: client.diagnostics() })`, Python `build_report(credential, diagnostics=…)`, Dart `buildReport(credential, diagnostics: …)`, Kotlin `Report.build(credential, diagnostics = …)`, Swift `try await Report.build(credential: …, diagnostics: …)`, C# `Report.BuildAsync(credential, diagnostics: …)`.
+
+**CLI** (TypeScript and Python packages; the credential comes first):
+
+```bash
+omni-adapter doctor   "$CONNECT_TOKEN" [--json]
+omni-adapter send     "$CONNECT_TOKEN" door.open true                  # acked; exit 0/1
+omni-adapter send     "$CONNECT_TOKEN" robot.status '{"x":1}' --json   # JSON convention
+omni-adapter watch    "$CONNECT_TOKEN" 'line3.*' --count 5 --timeout 30   # NDJSON {ts, channel, value, from}
+omni-adapter watch    "$CONNECT_TOKEN" --history                       # include the replay backlog
+omni-adapter record   "$CONNECT_TOKEN" 'sensor.*' --out run.ndjson --timeout 60
+omni-adapter replay   "$CONNECT_TOKEN" run.ndjson --speed 2
+omni-adapter simulate "$CONNECT_TOKEN" sensor.temperature --sine 18..26 --hz 2 --seconds 30
+```
+
+**Examples.** Every language has three runnable common examples — quickstart, bidirectional + roster, resilience (reconnect, offline queue, auto-rejoin). The npm and NuGet packages ship them under `examples/` (paths from the package root):
+
+- npm: `examples/01-quickstart.ts` · `02-sensor-bridge.ts` · `03-operations-console.ts`, plus `_shared.ts` (the credential helper they import). Node does not run TypeScript from inside `node_modules`: copy the example and `_shared.ts` into the project, change `'../dist/index.js'` to `'@studioxid/omni-adapter'` in both, and run it with Node 22.18+ (`node 01-quickstart.ts "$CONNECT_TOKEN"`) or `npx tsx`.
+- NuGet: `examples/Quickstart/Program.cs` · `RosterBridge/Program.cs` · `Resilience/Program.cs` — each is the whole program of a `dotnet new console` app with the package added.
+
+In the adapter repository they are in `typescript/examples/`, `python/examples/`, `csharp/examples/`, `kotlin/src/examples/`, `swift/Examples/` and `dart/example/` (`docs/parity.json` → `commonExamples` names each file).
+
+## Optional
+
+Screens are experimental and need a recent Connect server — check `docs/COMPATIBILITY.md` (in the npm and NuGet packages, and at that path in the adapter repository) before relying on them. The full guide is `skills/using-omni-adapter/references/screens-and-remote-input.md` (same places).
+
+### Declaring a screen (`providesView`)
+
+`providesView: 'none'` (default — data only) · `'web'` — a page shown by an **Adapter View** layer · `'stream'` — the adapter renders and broadcasts its own screen into an **Adapter Stream** layer. Layers find the adapter by `displayName`, so keep it stable. Declaring does not make a picture appear — the layer shows "waiting" until the adapter streams. `doctor` reports whether the server accepts `providesView` (an older server strips it silently) and whether remote input exists on the server (standalone servers only).
+
+### Adapter View and the Engine profile
+
+An Adapter View layer (Add → Adapters → Adapter View: a page URL + the channels it may use) embeds your page and hands it a `MessagePort`, so the page exchanges stage messages **without a credential and without a seat**. In TypeScript, `connect()` with no credential inside that iframe takes this Engine profile automatically — call it during page start-up, before awaiting anything else (the port arrives once, at the iframe's load event). Dart (Flutter web) and C# (Blazor WebAssembly) build an `EngineTransport` explicitly, and the Engine-only controls live on `EngineTransport` there, not on the client. `receives` must list exact channel names (no wildcards — the port delivers only what is subscribed). There is no history ring, `members()` is empty and there is no `sendTo`; `latest()` works (the host replays each subscribed channel's last value). In TypeScript `client.engine` adds a presenter lease (`acquireControl`), shared state (`setState`/`onState`, ≤ 8 KB) and session snapshots (≤ 512 KB).
+
+### Broadcasting a screen
+
+The helper owns the signalling (announce on every connect, answer each viewer's offer, ICE relay, cleanup when viewers leave or the client ends); you supply the media — one WebRTC session per viewer from the stack you already use. No language adds a media dependency.
+
+```ts
+import { connect, startScreenBroadcast } from '@studioxid/omni-adapter';
+
+export async function broadcastCanvas(token: string, canvas: HTMLCanvasElement): Promise<void> {
+  // providesView: 'stream' — the server creates and binds my Adapter Stream layer when I join
+  const client = await connect({ secretKey: token, displayName: 'my-simulator', providesView: 'stream' });
+  console.log('layer name:', client.me?.displayName);   // the name the server gave me — may be 'my-simulator (2)'
+  const broadcast = startScreenBroadcast({
+    client,
+    stream: canvas.captureStream(30),
+    onRemoteInput: (msg) => console.log(msg.t, msg.x, msg.y),   // pointer: down|move|up|cancel, x/y in [0,1]
+  });
+  console.log(broadcast.viewerCount);   // broadcast.stop() ends it early
+}
+```
+
+| Language | Start | Notes |
+| --- | --- | --- |
+| Python | `await start_screen_broadcast(client, create_session=open_session, on_remote_input=…)` | `aiortc` via the `[stream]` extra; a 4-parameter factory `(viewer, send_ice, ice_servers, wire_input)` receives the input channel |
+| C# | `ScreenBroadcast.Start(client, createSession, onError, onRemoteInput)` | one `IBroadcastSession` per viewer; use the 3- or 4-parameter factory to receive the ICE servers; stop with `Dispose()`; the Unity example is the reference |
+| Kotlin | `startScreenBroadcast(client, createSession = { viewer, sendIce, iceServers, wireInput -> … })` | pass the factory **by name** — a trailing lambda binds to the last parameter (`scope`) |
+| Swift | `await startScreenBroadcast(client: client, createSession: { viewer, sendIce, iceServers, wireInput in … })` | |
+| Dart | `startScreenBroadcast(client: client, createSession: (viewer, sendIce, iceServers, wireInput) async => …)` | `flutter_webrtc` lives in your app |
+
+- **ICE servers come from the server**: every language has `fetchIceServers()` (STUN + short-lived TURN; successes are cached, failures are not — the next call asks again. On failure it returns a still-cached list (one about to expire), else the public STUN list when only the authenticated route failed and `/api/about` answered, else `[]`). The TS helper applies it; elsewhere hand it to your peer configuration. A peer built without it connects inside the same network only ("works in the office, remote viewers see nothing"). Do not hard-code STUN URLs.
+- **The layer comes from `providesView: 'stream'`**: on a server with adapter stream layers (unreleased), an adapter that joins with it gets its Adapter Stream layer created and bound by the server — in the first group placed on the stage, matched by the name the server gave it (`client.me.displayName`); a deleted layer comes back on the next join. Without the declaration no layer is created and the helper records `stream-undeclared` once in `diagnostics()`.
+- `ensureStreamLayer()` (Python `ensure_stream_layer()`) is optional — an idempotent call that returns that layer. `renamed: true` means the server gave you another name than you asked for (`name (2)`): another program on a different key uses this name, or you rotated keys without revoking the old one (a screen adapter's layer stays bound to the old key) — rename one, or revoke the old key; a layer under the original name will not show you. TypeScript, Python and Dart log a warning; all six expose `renamed`. `nameConflict` is a deprecated alias of `renamed`. Errors: 404 `NotSupported` (server too old), `RoomEnded` (no live session), 429 `TooManyRequests`, `ValidationError` with the server's message (not declared `providesView: 'stream'`, or too many Adapter Stream layers — the hint says which), `NotConnected` (5xx, network, ack timeout, or a server failure while re-validating the key after a 401), `SessionEnded` after `close()`; any other error of that re-validation passes through as `connect()` would report it (for example `AuthRevoked` for a revoked key).
+- When the stream source starts or changes after the helper started — not per frame — call `sourceChanged()` (Python `source_changed()`, C# `SourceChanged()`): it re-announces the adapter so viewers whose offer went unanswered offer again. Calls are coalesced to at most one announcement per second (the first call, then one at the end of the window if more came in); Python's is safe from any thread.
+- **Old sessions are closed for you**: when the adapter comes back with a new participant id (a rejoin into a new session, the 6-hour guest-token revalidation), the viewer sessions from before the drop are closed — viewers address the adapter by participant id and offer again (sessions a viewer opened to the new id while the adapter was still reconnecting stay).
+- **Early viewer ICE is queued**: candidates that arrive while the connection is being set up are applied once the offer is set (no age limit); candidates that arrive before the offer wait up to 10 s, matched by `negotiationId` — at most 200 per receiver, 4 waiting receivers per viewer and 64 in all (`ice-queue` in `diagnostics()` when something is dropped). The ICE-server lookup gives up after 5 s and uses the last known servers; a failed lookup is never cached, so the next viewer asks again (`ice-servers`).
+- **One session per viewer receiver**: the web keeps one receiver per (viewer page × adapter participant) — not per layer instance (two layers on one page that show this adapter share it) — and tags offers and ICE with its `receiverId`, so two tabs of the same PIN guest are two sessions instead of closing each other's. A new offer replaces only that receiver's session; `peer-left` closes every session of that participant; answers and ICE echo `negotiationId` and `receiverId`. Your session factory runs once per receiver (the same participant id twice) and `viewerCount` counts receivers. A viewer without `receiverId` (older web) keeps one session per participant. A participant keeps at most 4 receiver sessions. A fifth evicts first a session the helper knows is not live (TypeScript: its connection is not `connected`; where the app injects sessions: a receiver whose session has not sent its answer yet — an answered session stays live while it renegotiates), then the least recently negotiated one. Until a vanished tab is noticed — ICE takes seconds to report it, and an injected session only once the app passes it to `session_closed`/`sessionClosed` — a live tab that never renegotiates can be the one evicted, so report closures. Only PIN and share-link guests keep their participant id across a refresh and so leave old receivers behind; team members get a new id per socket and leave with `peer-left`. The TS helper also closes a session whose `RTCPeerConnection` goes `failed` or `closed`; where you inject the session, report that by passing it back — `broadcast.session_closed(session)` (Python, any thread), `SessionClosed(session)` (C#), `sessionClosed(session)` (Kotlin, Swift, Dart); an unknown or already replaced session is ignored.
+- If you drive `stage:signaling` yourself: send `{"kind":"ready"}` on every connect (reconnects included) or late viewers never find you, and use `addTrack(track, stream)` with a stream or the viewer gets no picture. Once the client has ended (from the moment `close()` is called, or the session ends), signaling sends are dropped silently — nothing reaches the viewers.
+- The picture is encoded once per viewer receiver — fine for small reviews (5–10 viewers).
+
+### Remote input
+
+An Editor viewing a broadcast screen can operate it with their pointer over a peer-to-peer `coc.input` data channel (standalone servers — the only servers that run adapters). **No code is needed beyond `onRemoteInput`:** the stage arms remote input for Editors as soon as the screen streams — no registration code. Standalone servers send lease-holder notices (key adapters are registered automatically on join and told the holder): input is accepted only from the Editor holding the lease — the Connect editor claims it automatically on the first pointer-down — and PIN or share-link viewers never control. Older servers that predate the notices never announce a holder; then the helpers' gate stays permissive and accepts every viewer's input. `submitRegistrationCode`, `resumeRegistration` and `onRemoteInputHolder` exist for registration-code deployments and are not needed otherwise. The helper whitelists directions, clamps `x`/`y` to `[0,1]` (top-left origin, no y-flip), validates pointer ids, synthesizes `cancel` when the holder changes, and re-sends `hello` every 10 s (a viewer whose tab went to the background recovers only through that). Only pointers exist — tap, drag, swipe, on-screen keyboards; no physical-keyboard input. Feed local and remote pointers through the same hit-test path. For a vehicle, block new `down`/`move` while moving but always let `up`/`cancel` through. Diagnose "operating does nothing" with the ring codes `input-channel` (channel opened), `hello` (sent) and `input-dropped` (frames discarded by the gate). References: `typescript/examples/13-driver-console.ts`, `python/examples/05_roadside_sign.py`, `dart/example_aaos`.
+
+### Unity
+
+`csharp/examples/Unity` in the adapter repository (Unity 2021.3 LTS; not in the NuGet package) is the reference: it ships the main-thread dispatcher, a lifecycle `MonoBehaviour` and `fetch-plugins.sh`. Not supported: WebGL. Not verified: IL2CPP. UPM packaging is not done — copy the **whole** dependency closure into `Assets/Plugins/` (Unity drops a plugin whose references it cannot resolve).
+
+- Callbacks arrive on the socket thread: marshal to the main thread before touching any Unity API; never block in a callback. Sends throw validation errors synchronously — wrap them in `try`.
+- Close the client in `OnDestroy`/`OnApplicationQuit` (`Dispose()` leaves without waiting).
+
+For a Unity screen broadcast, four things fail silently:
+
+1. Set `Application.runInBackground = true` — otherwise the frame loop (and the `WebRTC.Update()` pump) stops whenever the operator focuses the browser, and the connection drops after a few seconds.
+2. IMGUI (`OnGUI`) never reaches the broadcast; put stage-visible UI on a `Canvas` in `ScreenSpaceCamera` mode bound to the broadcast camera.
+3. The broadcast camera is the one with a `targetTexture`, not necessarily `Camera.main`.
+4. `RTCDataChannel.Send` throws before the channel is open, and `OnDataChannel` usually fires while it is still connecting — queue until `OnOpen`.
+
+### Android Automotive (AAOS) input injection
+
+`dart/example_aaos` shows two ways to inject remote pointers: into your own UI (convert the capture-relative `[0,1]` to view coordinates and correct for any offset such as a captured status bar), or device-wide with an `AccessibilityService.dispatchGesture` (screen-absolute coordinates, 1:1 with the capture; drives other apps too; re-check availability on resume). On AAOS, Settings does not list third-party accessibility services, and an emulator reboot resets the enabled list. Enable the service over adb by **appending** to the existing list (it holds the car's own `RotaryService` and `CarSafetyAccessibilityService`), then toggle `accessibility_enabled` 0 → 1 so the system binds it. AAOS runs apps as user 10 — grant with `--user 10`. For a dev rig the example declares `WRITE_SECURE_SETTINGS` (grantable over adb on a development device) and enables its own service on start:
+
+```bash
+adb shell pm grant --user 10 <your.package> android.permission.WRITE_SECURE_SETTINGS
+```
+
+### Links
+
+The npm and NuGet packages carry these files; paths are from the package root — npm `node_modules/@studioxid/omni-adapter/`, NuGet `~/.nuget/packages/studioxid.omniadapter/<version>/` (Windows `%USERPROFILE%\.nuget\packages\…`):
+
+- This guide: `llms.txt` (the PyPI and pub.dev packages carry it too)
+- First connection, step by step in all six languages: `docs/getting-started.md`
+- Feature support per language and minimum server: `docs/COMPATIBILITY.md`
+- Claude Code skill for adapter consumers: `skills/using-omni-adapter/` — copy the folder into the project's `.claude/skills/`
+- The three common examples: `examples/`
+- The language reference: the package's `README.md`, also shown on its registry page (npmjs.com, nuget.org, pypi.org, pub.dev)
+
+The adapter repository (`ProtoPie/omni-adapter`) is not public yet. Contributors with access find the same files there, the other languages' READMEs (`python/README.md` · `kotlin/README.md` · `swift/README.md` · `dart/README.md`), `docs/parity.json` (the machine-readable matrix) and `VERSIONING.md`.

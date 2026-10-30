@@ -3,7 +3,6 @@ import Foundation
 /// Options for `MemoryStage.join(_:)` — the declaration options of `ConnectOptions` without credentials and networking.
 public struct MemoryJoinOptions: Sendable {
     public var displayName: String?
-    public var nodeType: String?
     public var providesView: String?
     public var receives: [String]?
     public var sends: [String]?
@@ -15,7 +14,6 @@ public struct MemoryJoinOptions: Sendable {
 
     public init(
         displayName: String? = nil,
-        nodeType: String? = nil,
         providesView: String? = nil,
         receives: [String]? = nil,
         sends: [String]? = nil,
@@ -26,7 +24,6 @@ public struct MemoryJoinOptions: Sendable {
         onLog: (@Sendable (LogEntry) -> Void)? = nil
     ) {
         self.displayName = displayName
-        self.nodeType = nodeType
         self.providesView = providesView
         self.receives = receives
         self.sends = sends
@@ -152,7 +149,6 @@ public final class MemoryStage: @unchecked Sendable {
                 displayName: displayName,
                 providesView: options.providesView,
                 standby: nil,
-                nodeType: options.nodeType,
                 clientType: "adapter",
                 receives: receives,
                 sends: sends,
@@ -396,7 +392,7 @@ public final class MemoryStage: @unchecked Sendable {
     private static func withStandby(_ m: Member, _ standby: Bool) -> Member {
         Member(
             participantId: m.participantId, displayName: m.displayName, providesView: m.providesView,
-            standby: standby, nodeType: m.nodeType, clientType: m.clientType, receives: m.receives,
+            standby: standby, clientType: m.clientType, receives: m.receives,
             sends: m.sends, strictRouting: m.strictRouting, exclusiveName: m.exclusiveName, osHostname: m.osHostname
         )
     }

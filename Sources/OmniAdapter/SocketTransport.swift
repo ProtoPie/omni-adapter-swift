@@ -11,7 +11,6 @@ public struct SocketTransportOptions: Sendable {
     public var osHostname: String?
     public var receives: [String]?
     public var sends: [String]?
-    public var nodeType: String?
     public var providesView: String?
     // 이름 하나당 활성 하나 opt-in — 서버가 활성/대기를 판정한다(T4).
     /// Opt in to one active instance per name — the server judges which instance is active and which are standby.
@@ -171,7 +170,6 @@ public final class SocketTransport: Transport, @unchecked Sendable {
         }
         if let receives = options.receives, !receives.isEmpty { body["receives"] = receives }
         if let sends = options.sends, !sends.isEmpty { body["sends"] = sends }
-        if let nodeType = options.nodeType { body["nodeType"] = nodeType }
         if let providesView = options.providesView { body["providesView"] = providesView }
         // false 도 실어 보낸다 — 규칙을 **끄는** 재신고가 여기서 걸리면 서버에 남은
         // 이전 true 때문에 어댑터가 영원히 대기로 판정된다.
@@ -1762,7 +1760,6 @@ public final class SocketTransport: Transport, @unchecked Sendable {
             standby: strictBool(member?["standby"]),
             // 어댑터 자기신고 — 전부 optional 이고 부재/null/타입 불일치는 nil. 서버는 미신고를
             // null(NSNull) 로 보낸다(StageMember.receives?: string[] | null).
-            nodeType: member?["nodeType"] as? String,
             clientType: member?["clientType"] as? String,
             receives: stringArray(member?["receives"]),
             sends: stringArray(member?["sends"]),

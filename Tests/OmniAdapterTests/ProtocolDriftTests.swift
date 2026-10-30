@@ -228,12 +228,9 @@ final class ProtocolDriftTests: XCTestCase {
         XCTAssertTrue(src.contains("APP_AHEAD_MESSAGE_MARKER = '\(Protocol.appAheadMessageMarker)'"))
     }
 
-    func testClientTypeAndNodeTypesLockstep() throws {
+    func testClientTypeAndProvidesViewsLockstep() throws {
         let src = try tsSource()
         XCTAssertTrue(src.contains("ADAPTER_CLIENT_TYPE = '\(Protocol.adapterClientType)'"))
-        for nodeType in Protocol.adapterNodeTypes {
-            XCTAssertTrue(src.contains("'\(nodeType)'"), "nodeType \(nodeType) missing from TS protocol.ts")
-        }
         // providesView 열거도 기준본에 고정(C#/Dart 는 이미 함) — 화면 갈래 선별 필드.
         for view in Protocol.adapterProvidesViews {
             XCTAssertTrue(src.contains("'\(view)'"), "providesView \(view) missing from TS protocol.ts")
@@ -413,8 +410,10 @@ final class SocketTransportUnitTests: XCTestCase {
     }
 
     /// 서버 StageMember 는 join 시 신고한 값을 전부 로스터에 되돌려 주는데, 매퍼가 그것을 버리면
-    /// 프로그램 A 는 B 가 하드웨어인지도, B 가 어느 채널을 듣는지도 알 수 없다 — 여러 프로그램이
+    /// 프로그램 A 는 B 가 어느 채널을 듣는지 알 수 없다 — 여러 프로그램이
     /// 한 스테이지에서 서로를 트리거하는 토폴로지의 첫 번째 조용한 실패.
+    /// 서버가 아직 싣는 `nodeType` 은 어댑터가 더는 읽지 않는 필드다 — `Member` 에 그 속성이 없으니
+    /// 입력에 있어도 매퍼가 무시한다(컴파일러가 증명).
     func testToMemberCarriesAdapterDeclarations() {
         let m = SocketTransport.toMember(
             [
@@ -426,7 +425,6 @@ final class SocketTransportUnitTests: XCTestCase {
             fallbackId: "f", fallbackName: "f"
         )
         XCTAssertEqual(m.clientType, "adapter")
-        XCTAssertEqual(m.nodeType, "hardware")
         XCTAssertEqual(m.receives, ["actuator.cmd", "robot.*"])
         XCTAssertEqual(m.sends, ["sensor.temperature"])
         XCTAssertEqual(m.strictRouting, true)
@@ -437,13 +435,12 @@ final class SocketTransportUnitTests: XCTestCase {
         let browser = SocketTransport.toMember(
             [
                 "participantId": "p2", "displayName": "host", "clientType": NSNull(),
-                "nodeType": NSNull(), "receives": NSNull(), "sends": NSNull(),
+                "receives": NSNull(), "sends": NSNull(),
                 "strictRouting": NSNull(), "exclusiveName": NSNull(), "guestOSHostname": NSNull(),
             ],
             fallbackId: "f", fallbackName: "f"
         )
         XCTAssertNil(browser.clientType)
-        XCTAssertNil(browser.nodeType)
         XCTAssertNil(browser.receives)
         XCTAssertNil(browser.sends)
         XCTAssertNil(browser.strictRouting)
@@ -452,11 +449,10 @@ final class SocketTransportUnitTests: XCTestCase {
 
         // 타입 불일치는 버린다 — 문자열이 아닌 항목만 걸러내고 나머지는 남긴다
         let odd = SocketTransport.toMember(
-            ["participantId": "p3", "displayName": "odd", "receives": ["a.b", 7, NSNull()], "nodeType": 3],
+            ["participantId": "p3", "displayName": "odd", "receives": ["a.b", 7, NSNull()]],
             fallbackId: "f", fallbackName: "f"
         )
         XCTAssertEqual(odd.receives, ["a.b"])
-        XCTAssertNil(odd.nodeType)
 
         // 실제 경로는 JSONSerialization 을 지난다 — 숫자 0/1 은 NSNumber 로 와서 `as? Bool` 을 통과하므로
         // 매퍼가 CFBoolean 만 인정해야 다른 다섯 언어(불리언 타입만 인정)와 같다. 문자열 불리언과

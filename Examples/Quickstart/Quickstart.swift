@@ -27,8 +27,7 @@ enum Quickstart {
                     secretKey: credential,
                     displayName: "Swift Quickstart",
                     osHostname: ProcessInfo.processInfo.hostName,
-                    sends: ["hello.world"], // Backstage 포트 칩 + 정확한 흐름 점등
-                    nodeType: "service"
+                    sends: ["hello.world"] // Backstage 포트 칩 + 정확한 흐름 점등
                 )
             )
         } catch let error as AdapterError {

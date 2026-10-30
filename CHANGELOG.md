@@ -1,9 +1,21 @@
 # Changelog — OmniAdapter (Swift)
 
 All notable changes to the Swift adapter. Versioning follows
-[SemVer](https://semver.org); release tags use the `swift-v*` prefix
-(independent of the other language packages). See `/VERSIONING.md` for the
+[SemVer](https://semver.org). Each release is tagged `X.Y.Z` in the package
+repository `ProtoPie/omni-adapter-swift` (`swift-v*` in the main repository),
+independent of the other language packages. See `/VERSIONING.md` for the
 policy and `/docs/COMPATIBILITY.md` for the server requirement matrix.
+
+## 0.1.0-beta.1 (2026-10-30)
+
+### Added
+
+- The package now carries `llms.txt`, the full usage guide for AI assistants, at its root.
+
+### Removed
+
+- The `nodeType` connect option (also on `MemoryStage`) and `Member.nodeType` are removed. The
+  adapter no longer declares a node type; Backstage shows every adapter with the same node look.
 
 ## 0.1.0-beta.0 (2026-10-29)
 

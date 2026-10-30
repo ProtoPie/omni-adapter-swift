@@ -89,9 +89,6 @@ public struct Member: Sendable, Equatable {
     /// Present only for participants that declared `exclusiveName`. **nil and false differ**:
     /// nil = the rule does not apply (or an older server makes no judgment at all), false = declared and currently active.
     public let standby: Bool?
-    /// The node type the adapter declared about itself — `"web"|"service"|"hardware"|"sensor"|"controller"|"display"`
-    /// (nil when not declared). Read as a loose `String` for the same reason as `providesView`.
-    public let nodeType: String?
     /// Which client software the participant joined with — the only value today is `"adapter"`. Browsers, desktop
     /// and native clients do not declare it, so it is nil for them. It is self-declared, not an auth boundary — for display only.
     public let clientType: String?
@@ -113,7 +110,6 @@ public struct Member: Sendable, Equatable {
         displayName: String,
         providesView: String? = nil,
         standby: Bool? = nil,
-        nodeType: String? = nil,
         clientType: String? = nil,
         receives: [String]? = nil,
         sends: [String]? = nil,
@@ -125,7 +121,6 @@ public struct Member: Sendable, Equatable {
         self.displayName = displayName
         self.providesView = providesView
         self.standby = standby
-        self.nodeType = nodeType
         self.clientType = clientType
         self.receives = receives
         self.sends = sends

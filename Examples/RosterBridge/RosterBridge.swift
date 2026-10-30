@@ -51,8 +51,7 @@ enum RosterBridge {
                     osHostname: ProcessInfo.processInfo.hostName,
                     // 선언 = Backstage 포트 칩 + 흐름 점등. 정확한 이름만(와일드카드 불가).
                     receives: ["door.command"],
-                    sends: ["door.state"],
-                    nodeType: "service"
+                    sends: ["door.state"]
                 )
             )
         } catch let error as AdapterError {

@@ -20,8 +20,6 @@ public struct ConnectOptions: Sendable {
     /// Send declarations.
     public var sends: [String]?
 
-    /// Node shape: web|service|hardware|sensor|controller|display.
-    public var nodeType: String?
     /// How a view is provided: none|web|stream. Unset = none.
     public var providesView: String?
 
@@ -69,7 +67,6 @@ public struct ConnectOptions: Sendable {
         osHostname: String? = nil,
         receives: [String]? = nil,
         sends: [String]? = nil,
-        nodeType: String? = nil,
         providesView: String? = nil,
         strictRouting: Bool = false
     ) {
@@ -80,7 +77,6 @@ public struct ConnectOptions: Sendable {
         self.osHostname = osHostname
         self.receives = receives
         self.sends = sends
-        self.nodeType = nodeType
         self.providesView = providesView
         self.strictRouting = strictRouting
     }
@@ -151,13 +147,6 @@ public func connect(_ options: ConnectOptions) async throws -> ConnectClient {
     guard (1...64).contains(displayName.count) else {
         throw AdapterError("ConfigError", "displayName must be 1..64 chars")
     }
-    if let nodeType = options.nodeType, !Protocol.adapterNodeTypes.contains(nodeType) {
-        throw AdapterError(
-            "ConfigError",
-            "nodeType must be one of \(Protocol.adapterNodeTypes.joined(separator: "|")) (got \"\(nodeType)\")"
-        )
-    }
-
     if let providesView = options.providesView, !Protocol.adapterProvidesViews.contains(providesView) {
         throw AdapterError(
             "ConfigError",
@@ -174,7 +163,6 @@ public func connect(_ options: ConnectOptions) async throws -> ConnectClient {
     transportOptions.osHostname = options.osHostname
     transportOptions.receives = receives
     transportOptions.sends = sends
-    transportOptions.nodeType = options.nodeType
     transportOptions.providesView = options.providesView
     transportOptions.exclusiveName = options.exclusiveName
     transportOptions.strictRouting = options.strictRouting

@@ -324,10 +324,9 @@ final class MemoryStageTests: XCTestCase {
         XCTAssertThrowsError(try stage.transport(MemoryJoinOptions(strictRouting: true))) { XCTAssertTrue("\($0)".contains("receives")) }
         XCTAssertThrowsError(try stage.transport(MemoryJoinOptions(receives: ["a.*"], strictRouting: true))) { XCTAssertTrue("\($0)".contains("wildcard")) }
         XCTAssertThrowsError(try stage.transport(MemoryJoinOptions(receives: (0..<33).map { "c.\($0)" }))) { XCTAssertTrue("\($0)".contains("32")) }
-        let t = try stage.transport(MemoryJoinOptions(displayName: "x", nodeType: "hardware", receives: [" a.b ", "a.b"]))
+        let t = try stage.transport(MemoryJoinOptions(displayName: "x", receives: [" a.b ", "a.b"]))
         XCTAssertEqual(t.member.displayName, "x")
         XCTAssertEqual(t.member.receives, ["a.b"])
-        XCTAssertEqual(t.member.nodeType, "hardware")
         XCTAssertEqual(t.member.clientType, "adapter")
     }
 
