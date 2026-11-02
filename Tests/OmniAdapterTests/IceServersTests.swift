@@ -10,9 +10,11 @@ final class IceServersTests: XCTestCase {
         private let lock = NSLock()
         private var replies: [IceServersResult]
         private(set) var calls = 0
+        private(set) var handlers = TransportHandlers()
         init(_ replies: [IceServersResult]) { self.replies = replies }
         func open(handlers: TransportHandlers) async throws -> Joined {
-            Joined(roomId: "stage-1", me: Member(participantId: "me-1", displayName: "Me"))
+            lock.withLock { self.handlers = handlers }
+            return Joined(roomId: "stage-1", me: Member(participantId: "me-1", displayName: "Me"))
         }
         func publish(_ input: PublishInput, ack: Bool) async -> PublishResult {
             PublishResult(ok: true)
@@ -62,6 +64,29 @@ final class IceServersTests: XCTestCase {
         XCTAssertEqual(servers, [])
     }
 
+    func testIceChangedDropsTheCache() async throws {
+        // stage:ice-changed — 서버의 TURN 회수 · 발급 멈춤 · 재개. 다음 조회가 새 자격을 받는다(TS 미러).
+        let later = Int64(Date().timeIntervalSince1970 * 1000) + 7_200_000
+        let transport = IceTransport([
+            IceServersResult(iceServers: [IceServer(urls: ["turn:1"], username: "u1", credential: "c")], expiresAt: later),
+            IceServersResult(iceServers: [IceServer(urls: ["turn:1"], username: "u2", credential: "c")], expiresAt: later),
+        ])
+        let client = ConnectClient(transport: transport)
+        try await client.open()
+        let first = await client.fetchIceServers()
+        XCTAssertEqual(first.first?.username, "u1")
+        _ = await client.fetchIceServers()
+        XCTAssertEqual(transport.calls, 1)
+        transport.handlers.onIceChanged?(["stageId": "stage-1", "reason": "revoked"])
+        // 인박스가 비워질 때까지 — 같은 액터의 다음 일이 드레인 뒤에 돈다.
+        for _ in 0..<50 where transport.calls == 1 {
+            let again = await client.fetchIceServers()
+            if again.first?.username == "u2" { break }
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(transport.calls, 2)
+    }
+
     func testExpiringCredentialsAreRefetched() async throws {
         // TURN 자격증명은 만료된다 — 만료 임박이면 캐시를 버리고 다시 받는다.
         let soon = Int64(Date().timeIntervalSince1970 * 1000) + 30_000
@@ -76,6 +101,15 @@ final class IceServersTests: XCTestCase {
         let second = await client.fetchIceServers()
         XCTAssertEqual(second.first?.username, "u2")
         XCTAssertEqual(transport.calls, 2)
+    }
+
+    func testIceRefreshAtIsHalfTheRemainingLifetimeOrTheMarginBeforeExpiry() {
+        // 받을 때 남았던 수명의 절반 — 새 송출 연결이 늘 수명 절반 넘게 남은 자격으로 열리게(TS 미러). 짧으면 만료 1분 전.
+        let fetched: Int64 = 1_000_000
+        XCTAssertEqual(ConnectClient.iceRefreshAt(expiresAt: fetched + 7_200_000, fetchedAt: fetched), fetched + 3_600_000)
+        XCTAssertEqual(ConnectClient.iceRefreshAt(expiresAt: fetched + 30_000, fetchedAt: fetched), fetched + 30_000 - 60_000)
+        XCTAssertNil(ConnectClient.iceRefreshAt(expiresAt: nil, fetchedAt: fetched))
+        XCTAssertEqual(ConnectClient.iceRefreshMarginMs, 60_000)
     }
 
     private func realTransport() async throws -> SocketTransport {

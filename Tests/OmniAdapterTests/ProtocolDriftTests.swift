@@ -152,6 +152,7 @@ final class ProtocolDriftTests: XCTestCase {
             ("AdapterRegisterSubmit", Protocol.ClientEvents.adapterRegisterSubmit),
             ("AdapterRegisterResume", Protocol.ClientEvents.adapterRegisterResume),
             ("AdapterLeaseHolder", Protocol.ServerEvents.adapterLeaseHolder),
+            ("IceChanged", Protocol.ServerEvents.iceChanged),
         ]
         for (key, value) in pairs {
             XCTAssertTrue(

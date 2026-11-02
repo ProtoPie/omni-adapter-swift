@@ -5,13 +5,13 @@ tvOS installations — and exchange messages with prototypes in real time.
 Mirrors the TypeScript/Python/.NET/Kotlin/Dart adapters' wire contract and concepts on
 an async/await surface.
 
-**First time?** [Connect your first program to a stage](https://github.com/ProtoPie/omni-adapter/blob/main/docs/getting-started.md) walks
-through the adapter key, the install and the adapter name step by step.
+**First time?** The step-by-step guide for a first connection (the adapter key, the install and the
+adapter name, in all six languages) is `docs/getting-started.md`, shipped in the adapter's npm and
+NuGet packages. Everything a Swift program needs is also in this README and in `llms.txt`.
 
-**For AI assistants** — the full usage guide `llms.txt` sits at the root of the main repository ([`llms.txt`](https://github.com/ProtoPie/omni-adapter/blob/main/llms.txt));
-the Claude Code skill installs with `/plugin marketplace add ProtoPie/omni-adapter` then
-`/plugin install omni-adapter@studioxid` (or copy
-[`skills/using-omni-adapter/`](https://github.com/ProtoPie/omni-adapter/tree/main/skills/using-omni-adapter) into `.claude/skills/`). Must-know rules for Swift:
+**For AI assistants** — the full usage guide `llms.txt` sits at the root of this package (in a
+SwiftPM checkout: `.build/checkouts/omni-adapter-swift/llms.txt`; in Xcode, under the project's
+`SourcePackages/checkouts/omni-adapter-swift/`). Must-know rules for Swift:
 
 - **Credential**: only a `cst_…` adapter token (Share → Adapter keys → Create key, then Copy) or a bare `ck_…` key with
   `url` + `stageId`; read it from an environment variable (`ProcessInfo.processInfo.environment["CONNECT_TOKEN"]`),
@@ -71,7 +71,7 @@ let package = Package(
     name: "MyAdapter",
     platforms: [.macOS(.v10_15), .iOS(.v13)],   // required — without it SwiftPM refuses the dependency
     dependencies: [
-        .package(url: "https://github.com/ProtoPie/omni-adapter-swift", from: "0.1.0-beta.1"),
+        .package(url: "https://github.com/ProtoPie/omni-adapter-swift", from: "0.1.0-beta.2"),
     ],
     targets: [
         .executableTarget(
@@ -86,12 +86,12 @@ let package = Package(
 In an Xcode app project: File → Add Package Dependencies… and enter the URL above.
 
 Only beta versions are published so far, and SwiftPM never picks a prerelease unless the
-requirement names one: `from: "0.1.0"` finds nothing, while `from: "0.1.0-beta.1"` takes the beta
-and later 0.1.0 as well. In Xcode, set the dependency rule's lower bound to `0.1.0-beta.1` (or
-choose Exact Version). Mirror tags carry no prefix — the version is the tag itself (`0.1.0-beta.1`).
+requirement names one: `from: "0.1.0"` finds nothing, while `from: "0.1.0-beta.2"` takes the beta
+and later 0.1.0 as well. In Xcode, set the dependency rule's lower bound to `0.1.0-beta.2` (or
+choose Exact Version). Mirror tags carry no prefix — the version is the tag itself (`0.1.0-beta.2`).
 
-Working from a checkout of the main repository instead (contributors, or a change that has
-not reached the mirror yet)? Depend on its `swift/` folder by path —
+Working from a checkout of the main adapter repository instead (contributors with access
+to it)? Depend on its `swift/` folder by path —
 `.package(path: "<repo>/swift")` with `.product(name: "OmniAdapter", package: "swift")`,
 because the identity of a path dependency is the directory name — or, in Xcode, File → Add
 Package Dependencies… → Add Local… and pick `<repo>/swift`.
@@ -142,7 +142,7 @@ let client = try await connect(options)
 **A screen** — set `options.providesView = "stream"` if this program broadcasts a screen
 (`startScreenBroadcast`, below). The server then creates the **Adapter Stream** layer for your name
 on the stage, or binds the one a designer already placed, as soon as you connect — nothing else to
-call. `providesView = "web"` is for an Adapter View page; leave it unset otherwise.
+call. `providesView = "web"` is for a page shown in a Web View layer; leave it unset otherwise.
 
 ## Names and closing
 

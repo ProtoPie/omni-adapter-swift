@@ -6,6 +6,28 @@ repository `ProtoPie/omni-adapter-swift` (`swift-v*` in the main repository),
 independent of the other language packages. See `/VERSIONING.md` for the
 policy and `/docs/COMPATIBILITY.md` for the server requirement matrix.
 
+## 0.1.0-beta.2 (2026-11-02)
+
+- Changed: the ICE-server list is fetched again once half of the lifetime it had when fetched has
+  passed (at the latest a minute before it expires), instead of only a minute before expiry. A
+  screen-broadcast connection answered just before that refresh used to lose its relay when the
+  credential expired a minute later. The credential a new connection opens with now has at least a
+  quarter of its lifetime left — usually more than half, because Connect servers hand senders a new
+  credential shortly before half-life. Connections still drop when their credential expires. Servers
+  that send `expiresAt` with a STUN-only answer are asked again at half that re-check time.
+
+- Added: when the server sends `stage:ice-changed` — it revoked this participant's TURN credential,
+  or paused or resumed TURN issuance (Connect servers from 2026-10-31) — the cached ICE-server list is
+  dropped and the next answer fetches a fresh one. Connections already up are left alone; older
+  servers never send it. Web viewers on those servers also replace a relayed connection with a new
+  receiver before its credential expires, which reaches the adapter as a new viewer session.
+
+- Changed: the doctor's screen check and the docs follow Connect Omni's **Web View** layer, which
+  replaced Adapter View; only an Adapter Stream layer picks adapters by `providesView`.
+
+- Documentation: the README no longer links to the adapter's source repository, which is not
+  public yet; it points to files that ship in the packages instead.
+
 ## 0.1.0-beta.1 (2026-10-30)
 
 ### Added

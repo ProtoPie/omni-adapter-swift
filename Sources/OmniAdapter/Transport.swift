@@ -243,6 +243,10 @@ public struct TransportHandlers: Sendable {
     /// named in this notice, and discards all input when there is no holder.
     public var onAdapterLeaseHolder: (@Sendable ([String: Any]) -> Void)?
 
+    /// `stage:ice-changed` — fetch the ICE servers again (the server revoked this participant's TURN credential, or
+    /// paused or resumed TURN issuance). The client drops its cached list.
+    public var onIceChanged: (@Sendable ([String: Any]) -> Void)?
+
     /// Yourself as of each successful join (the first, a reconnect, a rejoin, and the older-server fallback without a
     /// payload) — called **right before** that join's `connected` is announced. A rejoin can carry a different
     /// participantId (the guest JWT lives 6 hours; a lost cookie) — the client updates ``ConnectClient/me`` with it
@@ -273,8 +277,9 @@ public struct AdapterRegistrationResult: Sendable, Equatable, CustomStringConver
     }
 }
 
-/// The result of an ICE-server lookup. ``expiresAt`` is present **only when TURN credentials are included** —
-/// without them (STUN only) nothing expires, so holding the cache for a long time is fine.
+/// The result of an ICE-server lookup. ``expiresAt`` is when to ask again: with TURN credentials it is their expiry;
+/// newer servers also send it with a STUN-only answer (a re-check time — TURN may appear later). Without it nothing
+/// expires, so holding the cache for a long time is fine. The client asks again at half the remaining lifetime.
 public struct IceServersResult: Sendable {
     public let iceServers: [IceServer]
     /// Epoch ms. Fetch again before this time or the relay drops.

@@ -10,7 +10,7 @@
 4. Languages — [TypeScript / JavaScript](#typescript--javascript) (+ React) · [Python](#python) · [C# / .NET](#c--net) · [Kotlin / JVM / Android](#kotlin--jvm--android) · [Swift](#swift) · [Dart / Flutter](#dart--flutter)
 5. [Errors and troubleshooting](#errors-and-troubleshooting)
 6. [Roster, diagnostics, testing, CLI](#roster-diagnostics-testing-cli)
-7. [Optional](#optional) — screens (Adapter View, screen broadcast, remote input), Unity checklist, Android Automotive input injection, links
+7. [Optional](#optional) — screens (Web View, screen broadcast, remote input), Unity checklist, Android Automotive input injection, links
 
 ## The credential
 
@@ -32,7 +32,7 @@
 8. **`connected` does not mean messages are flowing.** Check `state` and `queuedCount` together — see [connected but nothing happens](#connected-but-nothing-happens).
 9. **Never block inside a callback.** Callbacks run one at a time in arrival order; a blocked callback holds back every later message and every ack reply. Each language section says which thread you are on and how to hop.
 10. **Reuse one client, and stay under 60 messages a second.** Each connection takes one guest seat of the stage's cap; never connect per message. The server takes at most 60 messages a second per connection — coalesce high-rate sources with `throttle()`, and never use `ack: true` for a stream (acked sends go one per round trip).
-11. **Declare channels precisely.** `receives`/`sends` list channel names (up to 32 each); omit a field to declare nothing — an empty list is a `ConfigError`. Wildcards (`robot.*`) are allowed in `receives` only without `strictRouting`. `strictRouting: true` needs a non-empty `receives` of exact names; the server then delivers only those (plus messages targeted at you), and subscribing to anything else receives nothing.
+11. **Declare every channel the program uses — always, not only for `strictRouting`.** Each channel it sends on goes in `sends`, each channel it subscribes to in `receives`; when you add a send or a handler later, add its channel to the declaration in the same change. Connect learns a program's channels from this declaration before any message flows: the Backstage node's port chips (flow pulses light up only for declared channels) and `listeners()` read it, and a Web View page's declaration shows up on its layer as channels the page asked for, which the designer adds to the layer's Stage messages rules. An undeclared channel still flows, so a missing entry does not fail where you can see it — it shows up later as a connection Backstage does not draw and `listeners()` does not report. Up to 32 names each; omit a field only when the program never sends (or never receives) anything — an empty list is a `ConfigError`. Use exact names; a wildcard (`robot.*`) is allowed in `receives` only without `strictRouting` and outside a Web View page, for names you cannot know in advance. If a list would pass 32, tell the user instead of declaring part of it. `strictRouting: true` needs a non-empty `receives` of exact names; the server then delivers only those (plus messages targeted at you), and subscribing to anything else receives nothing.
 12. **When connecting fails, run the doctor before changing code** — it names the broken step. It checks the connection, not delivery: a green doctor plus a silent peer means the channel name, the routing or the receiving side is wrong.
 13. **An `AckTimeout` does not prove the server missed the message** — nor does `QueueOverflow`, `Standby` or `SessionEnded` on a queued acked send that had already gone out once; a blind retry can publish it twice.
 
@@ -124,8 +124,8 @@ async function join(): Promise<ConnectClient> {
     return await connect({
       secretKey: token,
       displayName: 'line3-controller',          // what the stage shows; keep it stable
-      receives: ['door.state', 'robot.status'], // omit the field to declare nothing
-      sends: ['door.open', 'robot.target'],
+      receives: ['door.state', 'robot.status'], // every channel it subscribes to (rule 11)
+      sends: ['door.open', 'robot.target'],     // every channel it sends on
     });
   } catch (err) {
     if (!isAdapterError(err)) throw err;
@@ -180,7 +180,7 @@ timer = setInterval(() => pushTarget(JSON.stringify({ x: Math.random(), y: Math.
 - `send()`/`sendJSON()` return promises: await them or attach `.catch` — an un-awaited rejection is unhandled (Node's default ends the process). Validation errors (bad value, closed client) reject the returned promise.
 - Callbacks run on the event loop in arrival order; a long synchronous handler delays everything, ack replies included.
 - Options worth knowing: `exclusiveName`, `strictRouting`, `autoRejoin` (default `true`), `ackTimeoutMs`/`joinTimeoutMs` (15000), `transports: ['polling']` (proxies that block WebSocket), `onLog` (stream the diagnostics ring into your logger), `queueLimit`, `osHostname`.
-- In a browser page the token is visible to every visitor. For a page embedded in a stage use an Adapter View layer, which needs no credential ([Optional](#adapter-view-and-the-engine-profile)); otherwise use a token you are ready to revoke.
+- In a browser page the token is visible to every visitor. For a page embedded in a Connect Omni stage use a Web View layer, which needs no credential ([Optional](#web-view-and-the-engine-profile)); otherwise use a token you are ready to revoke.
 
 **React** (`react` 18+ is an optional peer dependency). The provider connects on mount and closes on unmount; your own sends are not echoed into `useChannelJSON` — append them to local state.
 
@@ -419,7 +419,7 @@ repositories {
 }
 
 dependencies {
-    implementation("com.studioxid:omni-adapter:0.1.0-beta.1")
+    implementation("com.studioxid:omni-adapter:0.1.0-beta.2")
 }
 
 application {
@@ -515,7 +515,7 @@ import PackageDescription
 let package = Package(
     name: "MyAdapter",
     platforms: [.macOS(.v10_15), .iOS(.v13)],            // required
-    dependencies: [.package(url: "https://github.com/ProtoPie/omni-adapter-swift", from: "0.1.0-beta.1")],
+    dependencies: [.package(url: "https://github.com/ProtoPie/omni-adapter-swift", from: "0.1.0-beta.2")],
     targets: [
         .executableTarget(name: "MyAdapter", dependencies: [
             .product(name: "OmniAdapter", package: "omni-adapter-swift"),   // package = the repository name
@@ -604,7 +604,7 @@ for await event in await client.events() {
 
 ```yaml
 dependencies:
-  omni_adapter: ^0.1.0-beta.1   # beta only so far; ^0.1.0 does not match a prerelease
+  omni_adapter: ^0.1.0-beta.2   # beta only so far; ^0.1.0 does not match a prerelease
   # from a checkout of the repository instead:  omni_adapter: {path: <repo>/dart}
 ```
 
@@ -803,7 +803,7 @@ Every language also has it as a library call (see the [name map](#name-map)); ea
 | `standby` · `active` | exclusiveName judgment changed (`— dropped N queued sends` when becoming standby discarded the queue) |
 | `no-listener` | written only by a `listeners()` call when nobody declared the channel — `warn` if nobody receives it at all, `info` if undeclared receivers exist |
 | `input-channel` · `hello` · `input-dropped` | remote input (see Optional) |
-| `engine-channels` | Adapter View: a declared channel is outside the layer's channel list |
+| `engine-channels` | Web View: a declared channel is outside the layer's Stage messages rule for its direction (Receive for `receives`, Send for `sends`) |
 
 **Testing without a server — `MemoryStage`** (all six): an in-process stage with the same rules (no self-echo, strict routing, history re-seed on join and reconnect, exclusiveName judgment); no credential, no doctor, no screens, and no 60-messages-a-second limit (its transport sets `bypassRateLimit` — `bypass_rate_limit` in Python, `IRateLimitBypassTransport` in C#; Dart's client recognises `MemoryTransport` itself).
 
@@ -857,11 +857,11 @@ Screens are experimental and need a recent Connect server — check `docs/COMPAT
 
 ### Declaring a screen (`providesView`)
 
-`providesView: 'none'` (default — data only) · `'web'` — a page shown by an **Adapter View** layer · `'stream'` — the adapter renders and broadcasts its own screen into an **Adapter Stream** layer. Layers find the adapter by `displayName`, so keep it stable. Declaring does not make a picture appear — the layer shows "waiting" until the adapter streams. `doctor` reports whether the server accepts `providesView` (an older server strips it silently) and whether remote input exists on the server (standalone servers only).
+`providesView: 'none'` (default — data only) · `'web'` — the adapter's screen is a web page (a **Web View** layer shows a page by its URL, not by adapter name) · `'stream'` — the adapter renders and broadcasts its own screen into an **Adapter Stream** layer. The Adapter Stream layer finds the adapter by `displayName`, so keep it stable. Declaring does not make a picture appear — the layer shows "waiting" until the adapter streams. `doctor` reports whether the server accepts `providesView` (an older server strips it silently) and whether remote input exists on the server (standalone servers only).
 
-### Adapter View and the Engine profile
+### Web View and the Engine profile
 
-An Adapter View layer (Add → Adapters → Adapter View: a page URL + the channels it may use) embeds your page and hands it a `MessagePort`, so the page exchanges stage messages **without a credential and without a seat**. In TypeScript, `connect()` with no credential inside that iframe takes this Engine profile automatically — call it during page start-up, before awaiting anything else (the port arrives once, at the iframe's load event). Dart (Flutter web) and C# (Blazor WebAssembly) build an `EngineTransport` explicitly, and the Engine-only controls live on `EngineTransport` there, not on the client. `receives` must list exact channel names (no wildcards — the port delivers only what is subscribed). There is no history ring, `members()` is empty and there is no `sendTo`; `latest()` works (the host replays each subscribed channel's last value). In TypeScript `client.engine` adds a presenter lease (`acquireControl`), shared state (`setState`/`onState`, ≤ 8 KB) and session snapshots (≤ 512 KB).
+In Connect Omni, a **Web View** layer (Add → Web View: the page URL) embeds your page and hands it a `MessagePort` — every Web View does, there is no switch — so the page exchanges stage messages **without a credential and without a seat**. What passes is set on the layer, in its property panel's **Stage messages** section: **Receive** (the channels the page may receive) and **Send** (the channels it may send on), up to 32 exact names each, no wildcards; empty rules pass nothing. In TypeScript, `connect()` with no credential inside that iframe takes this Engine profile automatically — call it during page start-up, before awaiting anything else (the port arrives once, at the iframe's load event). Dart (Flutter web) and C# (Blazor WebAssembly) build an `EngineTransport` explicitly, and the Engine-only controls live on `EngineTransport` there, not on the client. `receives` and `sends` must list exact channel names (no wildcards — the port delivers only what is subscribed, and the host drops a whole send declaration when one name holds a pattern or is not 1–512 characters, so the adapter rejects those with `ConfigError`). Declare every channel the page uses (rule 11): `receives` goes to the host as the subscription and `sends` as a declaration (`engine:message-declare` — Connect Omni hosts from 2026-10-27 on; older ones ignore it), so Connect knows the page's channels before any message flows. A declared channel the layer's rules do not list yet appears in that Web View's Stage messages as a channel "This page asked for", and the designer adds it to Receive or Send with **Add** — nothing is added automatically, and the list shows only in the editor that is displaying the page (a send the rules refused is listed there too). Backstage draws the declared channels the rules allow as chips on that layer's node. With empty rules the page still connects and its requests reach the editor, but nothing flows until channels are added (Connect Omni hosts before 2026-10-27 hand over no port, so `connect()` ends in `JoinTimeout`). A `receives` entry outside the Receive rules never arrives and a send outside the Send rules is refused by the host — TypeScript notes each as `engine-channels` in `diagnostics()`. The layer's rules are readable for comparison: `client.engine.allowedReceives` / `allowedSends` in TypeScript, `allowedReceives` / `allowedSends` (Dart) and `AllowedReceives` / `AllowedSends` (C#) on `EngineTransport`; `allowedChannels` (both directions together) is deprecated. Saving changed rules reloads the page with a new port. There is no history ring, `members()` is empty and there is no `sendTo`; `latest()` works (the host replays each subscribed channel's last value). In TypeScript `client.engine` adds a presenter lease (`acquireControl`), shared state (`setState`/`onState`, ≤ 8 KB) and session snapshots (≤ 512 KB).
 
 ### Broadcasting a screen
 
@@ -891,7 +891,7 @@ export async function broadcastCanvas(token: string, canvas: HTMLCanvasElement):
 | Swift | `await startScreenBroadcast(client: client, createSession: { viewer, sendIce, iceServers, wireInput in … })` | |
 | Dart | `startScreenBroadcast(client: client, createSession: (viewer, sendIce, iceServers, wireInput) async => …)` | `flutter_webrtc` lives in your app |
 
-- **ICE servers come from the server**: every language has `fetchIceServers()` (STUN + short-lived TURN; successes are cached, failures are not — the next call asks again. On failure it returns a still-cached list (one about to expire), else the public STUN list when only the authenticated route failed and `/api/about` answered, else `[]`). The TS helper applies it; elsewhere hand it to your peer configuration. A peer built without it connects inside the same network only ("works in the office, remote viewers see nothing"). Do not hard-code STUN URLs.
+- **ICE servers come from the server**: every language has `fetchIceServers()` (STUN + short-lived TURN; successes are cached, failures are not — the next call asks again. On failure it returns a still-cached list (one due for refresh — lists are fetched again at half their remaining lifetime), else the public STUN list when only the authenticated route failed and `/api/about` answered, else `[]`). The TS helper applies it; elsewhere hand it to your peer configuration. A peer built without it connects inside the same network only ("works in the office, remote viewers see nothing"). Do not hard-code STUN URLs.
 - **The layer comes from `providesView: 'stream'`**: on a server with adapter stream layers (unreleased), an adapter that joins with it gets its Adapter Stream layer created and bound by the server — in the first group placed on the stage, matched by the name the server gave it (`client.me.displayName`); a deleted layer comes back on the next join. Without the declaration no layer is created and the helper records `stream-undeclared` once in `diagnostics()`.
 - `ensureStreamLayer()` (Python `ensure_stream_layer()`) is optional — an idempotent call that returns that layer. `renamed: true` means the server gave you another name than you asked for (`name (2)`): another program on a different key uses this name, or you rotated keys without revoking the old one (a screen adapter's layer stays bound to the old key) — rename one, or revoke the old key; a layer under the original name will not show you. TypeScript, Python and Dart log a warning; all six expose `renamed`. `nameConflict` is a deprecated alias of `renamed`. Errors: 404 `NotSupported` (server too old), `RoomEnded` (no live session), 429 `TooManyRequests`, `ValidationError` with the server's message (not declared `providesView: 'stream'`, or too many Adapter Stream layers — the hint says which), `NotConnected` (5xx, network, ack timeout, or a server failure while re-validating the key after a 401), `SessionEnded` after `close()`; any other error of that re-validation passes through as `connect()` would report it (for example `AuthRevoked` for a revoked key).
 - When the stream source starts or changes after the helper started — not per frame — call `sourceChanged()` (Python `source_changed()`, C# `SourceChanged()`): it re-announces the adapter so viewers whose offer went unanswered offer again. Calls are coalesced to at most one announcement per second (the first call, then one at the end of the window if more came in); Python's is safe from any thread.

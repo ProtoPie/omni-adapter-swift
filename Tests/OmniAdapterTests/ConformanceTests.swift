@@ -30,6 +30,24 @@ final class ConformanceTests: XCTestCase {
         "normalizeRuntimeVersion": { cases, failures in
             ConformanceTests.runNormalize("normalizeRuntimeVersion", AdapterIdentity.normalizeRuntimeVersion, cases, &failures)
         },
+        // ICE 목록을 다시 받을 때(epoch ms) — 받을 때 남았던 수명의 절반(내림)과 만료 1분 전 중 이른 쪽.
+        "iceRefreshAt": { cases, failures in
+            var ran = 0
+            for item in cases {
+                ran += 1
+                guard let c = item as? [String: Any], let fetched = (c["fetchedAt"] as? NSNumber)?.int64Value else {
+                    failures.append("malformed case: \(item)")
+                    continue
+                }
+                let expiresAt = (c["expiresAt"] as? NSNumber)?.int64Value
+                let want = (c["expect"] as? NSNumber)?.int64Value
+                let got = ConnectClient.iceRefreshAt(expiresAt: expiresAt, fetchedAt: fetched)
+                if got != want {
+                    failures.append("iceRefreshAt(\(String(describing: expiresAt)), \(fetched)) = \(String(describing: got)), expected \(String(describing: want))")
+                }
+            }
+            return ran
+        },
     ]
 
     func testRunnersMatchTheVectorSuitesOneToOne() throws {

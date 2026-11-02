@@ -329,14 +329,14 @@ private func checkScreenSupport(_ target: DoctorTarget, _ http: DoctorHttp) asyn
             return CheckResult(
                 id: "screen", label: label, status: .ok,
                 detail:
-                    "server accepts providesView — 'web' and 'stream' adapters can be picked by a layer"
+                    "server accepts providesView — 'stream' adapters can be picked by an Adapter Stream layer"
             )
         }
         return CheckResult(
             id: "screen", label: label, status: .warn,
             detail: "server ignores providesView — this build predates adapter screens",
             hint:
-                "Data messaging works. Screens do not: the adapter connects but never appears as a candidate in an Adapter View / Adapter Stream layer. Update the Connect server."
+                "Data messaging works. Screens do not: the adapter connects but never appears as a candidate in an Adapter Stream layer. Update the Connect server."
         )
     } catch {
         return CheckResult(id: "screen", label: label, status: .skip, detail: "\(error)")

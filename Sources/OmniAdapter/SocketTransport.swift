@@ -817,6 +817,11 @@ public final class SocketTransport: Transport, @unchecked Sendable {
             guard let self, let payload = data.first as? [String: Any] else { return }
             self.handlers.onAdapterLeaseHolder?(payload)
         }
+        // TURN 자격 회수 · 발급 멈춤 · 재개 — 클라이언트가 ICE 캐시를 버린다(내용은 보지 않는다 — 읽지 못해도 알린다).
+        socket.on(Protocol.ServerEvents.iceChanged) { [weak self] data, _ in
+            guard let self else { return }
+            self.handlers.onIceChanged?(data.first as? [String: Any] ?? [:])
+        }
         // 원시 패스스루 — 파싱하지 않는다. 이 통로의 의미(ready/sdp/ice)는
         // 어댑터와 Stage 캔버스 사이의 계약이고 트랜스포트는 배달만 한다.
         socket.on(Protocol.ServerEvents.signaling) { [weak self] data, _ in

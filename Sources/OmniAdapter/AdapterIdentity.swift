@@ -20,7 +20,7 @@ enum AdapterIdentity {
     /// This package's version — SwiftPM has no manifest version, so the top version heading of `CHANGELOG.md` is
     /// the source of truth (VERSIONING.md · release-swift.yml). `AdapterIdentityTests` compares against that heading —
     /// change both when bumping the version.
-    static let adapterVersion = "0.1.0-beta.1"
+    static let adapterVersion = "0.1.0-beta.2"
 
     private static let adapterVersionRe = try! NSRegularExpression(pattern: Protocol.adapterVersionPattern)
     private static let runtimeVersionRe = try! NSRegularExpression(pattern: Protocol.runtimeVersionPattern)

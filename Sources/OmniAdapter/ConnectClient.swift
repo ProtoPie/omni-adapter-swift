@@ -134,9 +134,10 @@ public actor ConnectClient {
     // 종전에는 이 캐시가 프로세스 수명 내내 유지돼, 장수 어댑터가 만료된 값을 영원히 재사용하고 나중에 붙는 뷰어에서
     // 조용히 실패했다.
     /// Cache of a successful ``fetchIceServers()`` result — failures are not cached (they can be retried).
-    /// ⚠️ TURN credentials **expire** — they are fetched again before ``iceExpiresAt`` (nil = STUN only, no expiry).
+    /// ⚠️ TURN credentials **expire** — they are fetched again at `iceRefreshDeadline` (``iceRefreshAt(expiresAt:fetchedAt:)``
+    /// — half the remaining lifetime; nil = STUN only, no expiry).
     private var iceServersCache: [IceServer]?
-    private var iceExpiresAt: Int64?
+    private var iceRefreshDeadline: Int64?
 
     private var stateValue: TransportState = .idle
     private var historyList: [StageMessage] = []
@@ -376,6 +377,10 @@ public actor ConnectClient {
             // 게이트라(null 뒤에 stale 통지가 늦게 도착하면 회수된 입력이 다시 열린다)
             // 소켓 스레드에서 **동기·순서대로** 배달한다(잠금 박스, 액터 미경유).
             self?.leaseHolderBox.deliver(payload)
+        }
+        handlers.onIceChanged = { [weak self] _ in
+            // 같은 FIFO 로 — 액터의 캐시를 그 자리에서 버린다(내용은 보지 않는다).
+            self?.enqueueEvent(.iceChanged)
         }
 
         let joined = try await transport.open(handlers: handlers)
@@ -789,7 +794,7 @@ public actor ConnectClient {
     /// cached — the next call asks again.
     func fetchIceServersOutcome() async -> (servers: [IceServer], ok: Bool) {
         let cached = iceServersCache
-        if let cached, !Self.iceExpiringSoon(iceExpiresAt) { return (cached, true) }
+        if let cached, iceRefreshDeadline.map({ Self.nowMs() < $0 }) ?? true { return (cached, true) }
 
         // ① 인증 경로 — 트랜스포트가 JWT 를 쥐고 있다. TURN 단기 자격증명은 여기로만 온다.
         let result = await transport.fetchIceServers()
@@ -798,7 +803,7 @@ public actor ConnectClient {
         if result.failed { return (cached ?? result.iceServers, false) }
         if !result.iceServers.isEmpty {
             iceServersCache = result.iceServers
-            iceExpiresAt = result.expiresAt
+            iceRefreshDeadline = Self.iceRefreshAt(expiresAt: result.expiresAt, fetchedAt: Self.nowMs())
             return (result.iceServers, true)
         }
         // 빈 결과 = REST 표면 없는 트랜스포트(Engine·fake) — 만료 임박 캐시가 있으면 그걸 쓰고, 없으면 빈 배열(서버 직접
@@ -807,11 +812,22 @@ public actor ConnectClient {
         return ([], true)
     }
 
-    /// Fetches again when less than 60 seconds of lifetime remain (no expiry = valid forever).
-    static func iceExpiringSoon(_ expiresAt: Int64?) -> Bool {
-        guard let expiresAt else { return false }
-        return expiresAt - Int64(Date().timeIntervalSince1970 * 1000) < 60_000
+    /// TURN credentials are fetched again at the latest this long before they expire (ms).
+    static let iceRefreshMarginMs: Int64 = 60_000
+
+    /// When a fetched ICE list is fetched again (epoch ms): once **half** of the lifetime it had when fetched has passed,
+    /// or ``iceRefreshMarginMs`` before expiry — whichever comes first. Without an expiry (STUN only) it is never fetched
+    /// again (nil). Why half: a screen-broadcast connection opens its relay with the credential held when it answers, and
+    /// the relay drops when that credential expires — fetching again at half the remaining lifetime leaves new connections
+    /// at least a quarter of the lifetime, usually more than half (the Connect server hands senders a new credential
+    /// shortly before half-life). Same answer as the other five languages (`docs/conformance.json`, suite `iceRefreshAt`).
+    static func iceRefreshAt(expiresAt: Int64?, fetchedAt: Int64) -> Int64? {
+        guard let expiresAt else { return nil }
+        let remaining = max(0, expiresAt - fetchedAt)
+        return min(fetchedAt + remaining / 2, expiresAt - iceRefreshMarginMs)
     }
+
+    static func nowMs() -> Int64 { Int64(Date().timeIntervalSince1970 * 1000) }
 
     // 서버가 zod 로 검증해 내려준다. TS `parseIceServers` 미러.
     /// Defensively filters `iceServers` from the `/api/about` response — the server validates it, but this may be talking
@@ -1201,6 +1217,11 @@ public actor ConnectClient {
                 // 활성이 떠났을 수 있다 — 그러면 내가 이어받는다(대기가 곧 예비).
                 requestJudgment()
             case .signaling(let payload): deliverSignaling(payload)
+            case .iceChanged:
+                // 서버가 이 참가자의 TURN 자격을 거뒀거나 발급을 멈췄다 · 다시 준다 — 다음 answer 가 새 목록을 받는다(붙은 연결은
+                // 그대로다).
+                iceServersCache = nil
+                iceRefreshDeadline = nil
             case .skippedFolds(let folds): latestCache.absorb(folds)
             case .caughtUp(let skipped):
                 note(
@@ -1717,6 +1738,8 @@ enum TransportEvent {
     case memberLeave(String)
     /// A raw `stage:signaling` frame — never dropped (its volume is bounded by the number of negotiations).
     case signaling([String: Any])
+    /// `stage:ice-changed` — drop the cached ICE servers.
+    case iceChanged
     case message(StageMessage)
     /// The latest folds of messages whose callbacks were skipped — merged into `latest()` at the position those messages held (an item the inbox produces).
     case skippedFolds(LatestCache)

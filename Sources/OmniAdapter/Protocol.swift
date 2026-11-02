@@ -25,7 +25,7 @@ public enum Protocol {
 
     // 원본: 서버 stage.ts providesView enum.
     /// Ways of providing a view — kept in lockstep with the server's enum.
-    /// What the Stage's view slots (Adapter View / Adapter Stream layers) use to narrow candidate
+    /// What the Stage's view slots (Web View / Adapter Stream layers) use to narrow candidate
     /// adapters. Not reported = "none".
     public static let adapterProvidesViews = ["none", "web", "stream"]
 
@@ -94,6 +94,9 @@ public enum Protocol {
         // 어댑터가 듣지 않는 것은 여기 두지 않는다(이 파일은 어댑터가 쓰는 부분집합).
         /// Adapter Stream remote input — server to adapter.
         public static let adapterLeaseHolder = "adapter:lease-holder"
+        /// Fetch this stage's ICE servers again — the server revoked this participant's TURN credential, or the deployment
+        /// paused or resumed new TURN issuance. The adapter drops its cached list; connections already up are left alone.
+        public static let iceChanged = "stage:ice-changed"
     }
 
     // 서버에 원본이 없는 P2P 계약이라
