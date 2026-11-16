@@ -346,7 +346,7 @@ private func checkScreenSupport(_ target: DoctorTarget, _ http: DoctorHttp) asyn
 private func checkValidate(_ target: DoctorTarget, _ http: DoctorHttp) async -> CheckResult {
     let label = "stage session"
     do {
-        // 진짜 키 입장이다(서버가 멤버를 만든다) — 트랜스포트처럼 어댑터 신원(ADR-0016 · D4)을 싣는다.
+        // 진짜 키 입장이다(서버가 멤버를 만든다) — 트랜스포트처럼 어댑터 신원을 싣는다.
         var fields: [String: Any] = ["token": target.secretKey, "displayName": "omni-adapter doctor"]
         for (key, value) in AdapterIdentity.fields() { fields[key] = value }
         let body = jsonString(fields)

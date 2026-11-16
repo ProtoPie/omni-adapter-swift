@@ -94,7 +94,8 @@ final class ConnectClientTests: XCTestCase {
         return (transport, client)
     }
 
-    /// actor 로 넘긴 콜백이 드레인될 때까지 — 고정 sleep 은 느린 러너에서 하드 실패한다.
+    /// 고정 대기 — "아무 일도 일어나지 않았다"를 보기 전에만 쓴다. 긍정 결과는 waitFor · waitForState · waitUntil 로 기다린다
+    /// (고정 sleep 뒤의 긍정 단언은 느린 러너에서 거짓 실패한다 — TestTiming).
     private func drain(_ ticks: Int = 3) async throws {
         for _ in 0..<ticks { try await Task.sleep(nanoseconds: 20_000_000) }
     }
@@ -105,7 +106,7 @@ final class ConnectClientTests: XCTestCase {
         _ client: ConnectClient,
         timeout: TimeInterval = 3
     ) async throws {
-        let deadline = Date().addingTimeInterval(timeout)
+        let deadline = TestTiming.deadline(timeout)
         while await client.queuedCount != 0, Date() < deadline {
             try await Task.sleep(nanoseconds: 5_000_000)
         }
@@ -119,7 +120,7 @@ final class ConnectClientTests: XCTestCase {
         _ expected: TransportState,
         timeout: TimeInterval = 3
     ) async throws {
-        let deadline = Date().addingTimeInterval(timeout)
+        let deadline = TestTiming.deadline(timeout)
         while await client.state != expected, Date() < deadline {
             try await Task.sleep(nanoseconds: 2_000_000)
         }
@@ -131,11 +132,19 @@ final class ConnectClientTests: XCTestCase {
         timeout: TimeInterval = 3,
         _ condition: @escaping () -> Bool
     ) async throws {
-        let deadline = Date().addingTimeInterval(timeout)
+        let deadline = TestTiming.deadline(timeout)
         while !condition() && Date() < deadline {
             try await Task.sleep(nanoseconds: 10_000_000)
         }
         XCTAssertTrue(condition(), "condition not met within timeout")
+    }
+
+    /// 액터를 읽어야 하는 조건을 기다린다(시한은 TestTiming.hangGuard 이상).
+    private func waitUntil(
+        _ what: String, file: StaticString = #filePath, line: UInt = #line, _ condition: () async -> Bool
+    ) async {
+        let met = await TestTiming.until(0, condition)
+        XCTAssertTrue(met, "\(what) — not met within \(Int(TestTiming.hangGuard)) s", file: file, line: line)
     }
 
     func testJoinExposesMeAndState() async throws {
@@ -309,11 +318,30 @@ final class ConnectClientTests: XCTestCase {
         transport.push("other.ch", 2)
         try await waitFor { seen.value == ["robot.arm.pos"] }
 
+        // 해제는 액터로 넘긴 Task 가 반영한다 — 고정 대기 뒤에 "반영됐을 것"이라 보면 느린 러너에서 해제 전의 값이 닿아
+        // 거짓 실패한다. 살아 있는 구독(표지)에 닿은 값이 해제한 구독에는 닿지 않는 때를 기다린다 — 표지가 받았으면 그
+        // 메시지의 콜백은 액터 위에서 한 번에 돌았거나 돌고 있다. 액터를 한 번 더 거치면 그 메시지의 콜백이 모두 끝났다.
+        let processed = Box<[Int]>([])
+        await client.on("robot.arm.pos") { message in
+            if case .int(let n) = message.value { processed.value.append(n) }
+        }
         sub.cancel()
-        try await drain(2)
-        transport.push("robot.arm.pos", 3)
-        try await drain(2)
-        XCTAssertEqual(seen.value.count, 1)
+        var probe = 2
+        await waitUntil("a cancelled subscription stops receiving") {
+            probe += 1
+            let before = seen.value.count
+            transport.push("robot.arm.pos", .int(probe))
+            let sent = probe
+            guard await TestTiming.until(0, { processed.value.contains(sent) }) else { return false }
+            _ = await client.state
+            return seen.value.count == before
+        }
+        let settled = seen.value.count
+        transport.push("robot.arm.pos", .int(probe + 1))
+        let last = probe + 1
+        try await waitFor { processed.value.contains(last) }
+        _ = await client.state
+        XCTAssertEqual(seen.value.count, settled, "a cancelled subscription received a later message")
     }
 
     func testHistorySeedsLatestAndHistoryJSON() async throws {
@@ -324,7 +352,7 @@ final class ConnectClientTests: XCTestCase {
             h("chat.message", .string(#"{"n":2}"#), 200),
             h("temp.reading", .int(25), 300),
         ])
-        try await drain()
+        try await waitForLatest(client, "temp.reading", .int(25))
 
         let latest = await client.latest("temp.reading")
         XCTAssertEqual(latest, .int(25))
@@ -343,7 +371,7 @@ final class ConnectClientTests: XCTestCase {
 
         // clearHistory 브로드캐스트 = 빈 스냅샷 → 캐시 클리어
         transport.pushHistory([])
-        try await drain()
+        await waitUntil("the empty snapshot cleared the cache") { await client.latest("temp.reading") == nil }
         let clearedLatest = await client.latest("temp.reading")
         let clearedHistory = await client.history()
         XCTAssertNil(clearedLatest)
@@ -353,7 +381,7 @@ final class ConnectClientTests: XCTestCase {
     func testOfflineQueueFlushesInOrder() async throws {
         let (transport, client) = try await makeClient()
         transport.setState(.reconnecting)
-        try await drain()
+        try await waitForState(client, .reconnecting)
 
         try await client.send("a.b", 1)
         try await client.send("a.b", 2)
@@ -376,7 +404,7 @@ final class ConnectClientTests: XCTestCase {
         try await drain(2)
 
         transport.setState(.reconnecting)
-        try await drain()
+        try await waitForState(client, .reconnecting)
         try await client.send("a.b", 1)
         try await client.send("a.b", 2)
         try await client.send("a.b", 3)
@@ -448,10 +476,10 @@ final class ConnectClientTests: XCTestCase {
     func testLiveSendNeverOvertakesTheQueueAndFlushPipelinesFireAndForget() async throws {
         let (transport, client) = try await makeClient()
         transport.setState(.reconnecting)
-        try await drain()
+        try await waitForState(client, .reconnecting)
         try await client.send("a.b", "queued-1")
         let acked = Task { try await client.send("a.b", "queued-2", ack: true) }
-        for _ in 0..<200 where await client.queuedCount < 2 { try await Task.sleep(nanoseconds: 5_000_000) }
+        await waitUntil("the acked send is queued") { await client.queuedCount >= 2 }
         try await client.send("a.b", "queued-3")
         transport.setState(.connected)
         try await drain()
@@ -481,9 +509,9 @@ final class ConnectClientTests: XCTestCase {
 
         // 큐에 ack 대기 항목을 남긴 채 종료 — 영구 hang 회귀 가드.
         transport.setState(.reconnecting)
-        try await drain()
+        try await waitForState(client, .reconnecting)
         let pending = Task { try await client.send("a.b", 1, ack: true) }
-        try await drain()
+        await waitUntil("the acked send is queued") { await client.queuedCount == 1 }
 
         transport.end("host-closed")
         try await drain()
@@ -614,6 +642,8 @@ final class ConnectClientTests: XCTestCase {
     private func drainStream(
         _ stream: AsyncStream<ClientEvent>, timeout: TimeInterval = 2
     ) async -> (events: [ClientEvent], finishedByItself: Bool) {
+        // 끝나는 스트림은 곧바로 돌아온다 — 감시 시한은 "끝나지 않는다"를 가르는 자리라 hangGuard 이상으로 둔다.
+        let timeout = TestTiming.atLeastHangGuard(timeout)
         let reader = Task { () -> [ClientEvent] in
             var out: [ClientEvent] = []
             for await event in stream { out.append(event) }
@@ -670,7 +700,7 @@ final class ConnectClientTests: XCTestCase {
         let stream = await client.events()
         // 스냅샷은 순서 확정 인박스를 지나므로 마지막 것이 반영됐으면 앞의 것도 전부 발화했다.
         for i in 0..<1000 { transport.pushHistory([h("c", .int(i), Int64(i))]) }
-        let deadline = Date().addingTimeInterval(3)
+        let deadline = TestTiming.deadline(3)
         while await client.history().first?.value != .int(999), Date() < deadline {
             try await Task.sleep(nanoseconds: 5_000_000)
         }
@@ -727,7 +757,7 @@ final class ConnectClientTests: XCTestCase {
         let transport = GatedOpenTransport()
         let client = ConnectClient(transport: transport)
         let opening = Task { try await client.open() }
-        let deadline = Date().addingTimeInterval(3)
+        let deadline = TestTiming.deadline(3)
         while !transport.waiting, Date() < deadline { try await Task.sleep(nanoseconds: 5_000_000) }
         await client.close()
         transport.release()
@@ -806,10 +836,8 @@ final class ConnectClientTests: XCTestCase {
             seen.append(payload["holderParticipantId"] as? String ?? "-")
         }
         transport.handlers.onAdapterLeaseHolder?(["holderParticipantId": "v-1"])
-        try await Task.sleep(nanoseconds: 50_000_000)
-        XCTAssertEqual(seen.values, ["v-1"])
-        sub.cancel()
-        try await Task.sleep(nanoseconds: 50_000_000)
+        try await waitFor { seen.values == ["v-1"] }
+        sub.cancel() // 해제는 그 자리에서 반영된다(잠금 아래 목록에서 뺀다)
         transport.handlers.onAdapterLeaseHolder?(["holderParticipantId": "v-2"])
         try await Task.sleep(nanoseconds: 50_000_000)
         XCTAssertEqual(seen.values, ["v-1"])
@@ -871,7 +899,7 @@ final class ConnectClientTests: XCTestCase {
     private func waitForLatest(
         _ client: ConnectClient, _ channel: String, _ expected: Primitive, timeout: TimeInterval = 5
     ) async throws {
-        let deadline = Date().addingTimeInterval(timeout)
+        let deadline = TestTiming.deadline(timeout)
         while await client.latest(channel) != expected, Date() < deadline {
             try await Task.sleep(nanoseconds: 2_000_000)
         }
@@ -1057,7 +1085,7 @@ final class ConnectClientTests: XCTestCase {
             transport.push("live.x", .int(round), ts: Int64(10_000 + round))
             // 둘 다 처리됐다 — 배달 방식과 무관한 두 신호(스냅샷이 history 에, 메시지가 콜백에).
             try await waitFor { delivered.count == round + 1 }
-            let deadline = Date().addingTimeInterval(3)
+            let deadline = TestTiming.deadline(3)
             while await client.history().first?.value != .int(round), Date() < deadline {
                 try await Task.sleep(nanoseconds: 1_000_000)
             }
@@ -1123,7 +1151,7 @@ final class ConnectClientTests: XCTestCase {
                 h.onMemberJoin?(Member(participantId: id, displayName: "viewer"))
                 h.onMemberLeave?(id)
             }
-            let deadline = Date().addingTimeInterval(3)
+            let deadline = TestTiming.deadline(3)
             while seen.count < 2 * (round + 1), Date() < deadline { try await Task.sleep(nanoseconds: 500_000) }
             if Array(seen.all.suffix(2)) != ["join:\(id)", "leave:\(id)"] { reversed += 1 }
         }
@@ -1145,7 +1173,7 @@ final class ConnectClientTests: XCTestCase {
         let release = DispatchSemaphore(value: 0)
         await client.on("gate") { _ in
             entered.value = true
-            _ = release.wait(timeout: .now() + 20)
+            _ = release.wait(timeout: .now() + TestTiming.farAway)
         }
         transport.push("gate", 1)
         try await waitFor { entered.value }
@@ -1222,7 +1250,7 @@ final class ConnectClientTests: XCTestCase {
         transport.push("door", "new", ts: 5)
         release.signal()
         try await waitForLatest(client, "flood", 998)
-        let deadline = Date().addingTimeInterval(3)
+        let deadline = TestTiming.deadline(3)
         while client.inboxMessageCount > 0, Date() < deadline { try await Task.sleep(nanoseconds: 2_000_000) }
         let door = await client.latest("door")
         XCTAssertEqual(door, "new", "건너뛴 옛 값이 뒤에 온 같은 ms 의 값을 덮었다")

@@ -79,10 +79,9 @@ final class IceServersTests: XCTestCase {
         XCTAssertEqual(transport.calls, 1)
         transport.handlers.onIceChanged?(["stageId": "stage-1", "reason": "revoked"])
         // 인박스가 비워질 때까지 — 같은 액터의 다음 일이 드레인 뒤에 돈다.
-        for _ in 0..<50 where transport.calls == 1 {
-            let again = await client.fetchIceServers()
-            if again.first?.username == "u2" { break }
-            try await Task.sleep(nanoseconds: 10_000_000)
+        await TestTiming.until(0, pollNanos: 10_000_000) {
+            if transport.calls != 1 { return true }
+            return await client.fetchIceServers().first?.username == "u2"
         }
         XCTAssertEqual(transport.calls, 2)
     }

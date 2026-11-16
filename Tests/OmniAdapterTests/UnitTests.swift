@@ -291,14 +291,15 @@ final class WildcardTests: XCTestCase {
         let channel = (0..<34).map { "s\($0)" }.joined(separator: ".")
         let started = Date()
         XCTAssertFalse(Wildcard.matchChannel(hostile, channel))
-        XCTAssertLessThan(Date().timeIntervalSince(started), 1.0)
+        // 결함(역추적)은 75초쯤 걸렸다 — 상한은 TestTiming.hangGuard 로 둔다(평소 1 ms 미만; 종전의 1초는 멈춘 러너에서 넘는다).
+        XCTAssertLessThan(Date().timeIntervalSince(started), TestTiming.hangGuard)
     }
 }
 
 final class AdapterErrorTests: XCTestCase {
     func testTheJoin429HintPointsAtFailedJoinsFromThisAddress() {
-        // 키 입장 429 는 이 주소의 누적 실패 캡(5분에 20번)이거나 키 하나의 분당 입장 상한(60)이고, 키 상한이 없는 서버(connect-v2
-        // 3464e4c4f 전)는 키 입장에도 IP 당 분당 5회 관문을 쓴다. 여섯 언어 바이트까지 같은 문장 — 메시지는 그대로다.
+        // 키 입장 429 는 이 주소의 누적 실패 캡(5분에 20번)이거나 키 하나의 분당 입장 상한(60)이고, 키 상한이 없는 이전
+        // 서버는 키 입장에도 IP 당 분당 5회 관문을 쓴다. 여섯 언어 바이트까지 같은 문장 — 메시지는 그대로다.
         let error = SocketTransport.mapValidateError(status: 429, code: "TooManyRequests", base: "http://h")
         XCTAssertEqual(error.code, "TooManyRequests")
         XCTAssertEqual(error.message, "token/validate rate limited (429) — retry later")
@@ -360,7 +361,7 @@ final class AdapterErrorTests: XCTestCase {
         XCTAssertEqual(SocketTransport.adapterKeyLengthRejection(limited, status: 401, keyLength: 10), limited)
     }
 
-    /// 429 · 503 의 `details.retryAfterMs`(connect-v2 3464e4c4f · 8fea9402d)는 문장 · 힌트 · retryAfterMs 에 실린다 — 올림, 유한한 양수만.
+    /// 429 · 503 의 `details.retryAfterMs` 는 문장 · 힌트 · retryAfterMs 에 실린다 — 올림, 유한한 양수만.
     func testRetryAfterMsRidesTheMessageTheHintAndTheError() {
         let limited = SocketTransport.mapValidateError(
             status: 429, code: "TooManyRequests", base: "http://h", details: ["retryAfterMs": 42_300])

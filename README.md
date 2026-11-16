@@ -57,6 +57,8 @@ await client.close()                                  // when you are done — l
 
 ## Install
 
+Requires Swift 6.0 or newer (Xcode 16+), on iOS 13+ / macOS 10.15+ / tvOS 13+ / watchOS 6+.
+
 The package is served from the public mirror repository
 [`ProtoPie/omni-adapter-swift`](https://github.com/ProtoPie/omni-adapter-swift): every
 release copies this `swift/` folder to the mirror's root and tags it `X.Y.Z`, which is what
@@ -71,7 +73,7 @@ let package = Package(
     name: "MyAdapter",
     platforms: [.macOS(.v10_15), .iOS(.v13)],   // required — without it SwiftPM refuses the dependency
     dependencies: [
-        .package(url: "https://github.com/ProtoPie/omni-adapter-swift", from: "0.1.0-beta.2"),
+        .package(url: "https://github.com/ProtoPie/omni-adapter-swift", from: "0.1.0"),
     ],
     targets: [
         .executableTarget(
@@ -85,10 +87,8 @@ let package = Package(
 
 In an Xcode app project: File → Add Package Dependencies… and enter the URL above.
 
-Only beta versions are published so far, and SwiftPM never picks a prerelease unless the
-requirement names one: `from: "0.1.0"` finds nothing, while `from: "0.1.0-beta.2"` takes the beta
-and later 0.1.0 as well. In Xcode, set the dependency rule's lower bound to `0.1.0-beta.2` (or
-choose Exact Version). Mirror tags carry no prefix — the version is the tag itself (`0.1.0-beta.2`).
+In Xcode, set the dependency rule to Up to Next Minor Version from `0.1.0`. Mirror tags carry no
+prefix — the version is the tag itself (`0.1.0`).
 
 Working from a checkout of the main adapter repository instead (contributors with access
 to it)? Depend on its `swift/` folder by path —
@@ -109,6 +109,17 @@ Two app-only settings, both of which otherwise fail the join with `NotConnected`
   Security blocks the join's HTTP request (the error message names App Transport Security).
   Add an `NSAppTransportSecurity` exception for that host to the app's Info.plist. A
   command-line tool has no Info.plist and is not affected.
+
+## Server requirements
+
+Joining, sending, receiving, acks and reconnects work against any Connect Omni server, but `ck_` adapter keys,
+`strictRouting`, `exclusiveName`, `providesView`, screen broadcasting and remote input need an
+**adapter-enabled** server (or web build). The minimum server for each feature is in the
+compatibility matrix, `docs/COMPATIBILITY.md` in the adapter's npm and NuGet packages.
+On an older server a bare `ck_` key is refused as a bad share token (`AuthRevoked` from `connect()`) and
+`ensureStreamLayer()` throws `NotSupported`, while the declarations degrade without an error: the server strips
+`strictRouting` (plain broadcast), `exclusiveName` (instances stay independent) and `providesView` (the adapter
+never appears as a screen candidate), and no viewer shows operate controls for remote input.
 
 ## Connecting
 
@@ -219,7 +230,7 @@ try await client.listeners("robot.status")  // who will receive it: .declared / 
 let push = await client.throttle("nav.position", hz: 10)     // coalesced sender (trailing flush)
 try push(.double(37.5665))                                   // a bad channel throws ValidationError here
 
-let slot = try await client.ensureStreamLayer()               // optional — the server already created/bound it on connect (providesView = "stream"); .renamed / .nameConflict
+let slot = try await client.ensureStreamLayer()               // optional — the server already created/bound it on connect (providesView = "stream"); .renamed
 let ice = await client.fetchIceServers()                      // server's WebRTC ICE config
 
 
@@ -503,9 +514,8 @@ resolves your screen by name (the participant id changes every run). Print
 - `ensureStreamLayer()` is optional (idempotent). `renamed` means the server joined you under a
   different name (`gauge (2)`: another program on a different key uses `gauge`, or the `gauge` layer is
   bound to a key you rotated without revoking — rename one, or revoke the old key), so a layer placed
-  for `gauge` will not show this screen. `nameConflict` is
-  deprecated and equals `renamed`. For two instances of the same program that take over from each
-  other, put both on one key and set `exclusiveName = true` (one active, the other standby). Errors are
+  for `gauge` will not show this screen. For two instances of the same program that take over from
+  each other, put both on one key and set `exclusiveName = true` (one active, the other standby). Errors are
   in the error table; cancelling the task throws `CancellationError`.
 
 Pass **`onRemoteInput`** to the same call to accept an Editor's pointers. The

@@ -6,7 +6,7 @@ import XCTest
 /// `client.test.ts` 의 ensure describe 미러).
 ///
 /// 트랜스포트 층은 REST 계약(POST+Bearer · 401 재검증 재시도 · 계약대로의 오류 매핑 · 시한 · 취소)을,
-/// 클라이언트 층은 roster 기반 `nameConflict` 판정을 본다. HTTP 는 주입된
+/// 클라이언트 층은 `renamed` 를 roster 없이 트랜스포트에서 넘기는지 본다. HTTP 는 주입된
 /// `URLSession` 의 `SequencedStubURLProtocol` 로 가로챈다 — 401→재검증→재시도처럼
 /// 호출마다 다른 응답이 필요해서 순서 소비 스텁이어야 한다.
 final class EnsureStreamLayerTests: XCTestCase {
@@ -211,9 +211,10 @@ final class EnsureStreamLayerTests: XCTestCase {
         let transport = try await stallingTransport(ackTimeout: 0.3)
         let started = Date()
         let task = Task { try await transport.ensureStreamLayer() }
-        // 매달리면 5초 뒤 끊고 실패로 본다 — 시험이 영영 멈추지 않게.
+        // 매달리면 끊고 실패로 본다 — 시험이 영영 멈추지 않게. 맞는 구현은 0.3초에 끝나므로 이 감시는 멀리(60초) 둔다:
+        // 가까이 두면 멈춘 러너에서 감시가 먼저 깨어 거짓 실패한다(TestTiming).
         let watchdog = Task {
-            try await Task.sleep(nanoseconds: 5_000_000_000)
+            try await Task.sleep(nanoseconds: UInt64(TestTiming.farAway * 1_000_000_000))
             task.cancel()
         }
         defer { watchdog.cancel() }
@@ -226,7 +227,8 @@ final class EnsureStreamLayerTests: XCTestCase {
         } catch {
             XCTFail("expected NotConnected, got \(error)")
         }
-        XCTAssertLessThan(Date().timeIntervalSince(started), 4.5)
+        // 상한은 "시한이 걸렸다"만 본다(평소 0.3초 — hangGuard 까지 여유) · 하한은 시한보다 일찍 끊지 않았음을 본다.
+        XCTAssertLessThan(Date().timeIntervalSince(started), TestTiming.hangGuard)
         XCTAssertGreaterThanOrEqual(Date().timeIntervalSince(started), 0.2)
     }
 
@@ -239,7 +241,7 @@ final class EnsureStreamLayerTests: XCTestCase {
         let started = Date()
         let task = Task { try await transport.ensureStreamLayer() }
         let watchdog = Task {
-            try await Task.sleep(nanoseconds: 6_000_000_000)
+            try await Task.sleep(nanoseconds: UInt64(TestTiming.farAway * 1_000_000_000))
             task.cancel()
         }
         defer { watchdog.cancel() }
@@ -252,25 +254,26 @@ final class EnsureStreamLayerTests: XCTestCase {
         } catch {
             XCTFail("expected NotConnected, got \(error)")
         }
-        XCTAssertLessThan(Date().timeIntervalSince(started), 5)
+        XCTAssertLessThan(Date().timeIntervalSince(started), TestTiming.hangGuard)
     }
 
     func testCancellationPropagatesAsCancellation() async throws {
         // 부른 쪽의 취소는 취소다 — 끊김(NotConnected)으로 바꾸면 재시도 루프가 취소를 못 알아봤다(조사 실측).
-        let transport = try await stallingTransport(ackTimeout: 15)
+        // 취소가 요청을 끊지 못하면 ack 시한까지 매달린다 — 그 시한을 조건 대기(hangGuard)보다 멀리(60초) 둔다.
+        let transport = try await stallingTransport(ackTimeout: TestTiming.farAway)
         let task = Task { try await transport.ensureStreamLayer() }
-        try await Task.sleep(nanoseconds: 150_000_000)
+        // 요청이 나간 뒤에 취소한다 — 고정 대기 뒤에 취소하면 느린 러너에서 요청 전에 취소돼 아래 hits 가 1 이다.
+        await TestTiming.until { SequencedStubURLProtocol.hits == 2 }
         task.cancel()
         let started = Date()
-        // 취소가 요청을 끊지 못하면 ack 시한(15초)까지 매달린다 — 그 전에 실패로 본다.
         let done = DoneFlag()
         let outcome = Task { () -> Result<EnsuredStreamLayer, Error> in
             defer { done.set() }
             do { return .success(try await task.value) } catch { return .failure(error) }
         }
-        let deadline = Date().addingTimeInterval(5)
+        let deadline = TestTiming.deadline()
         while Date() < deadline, !done.isSet { try await Task.sleep(nanoseconds: 20_000_000) }
-        guard done.isSet else { return XCTFail("cancellation did not end the request within 5 s") }
+        guard done.isSet else { return XCTFail("cancellation did not end the request within the hang guard") }
         do {
             _ = try await outcome.value.get()
             XCTFail("expected CancellationError")
@@ -279,7 +282,7 @@ final class EnsureStreamLayerTests: XCTestCase {
         } catch {
             XCTFail("expected CancellationError, got \(error)")
         }
-        XCTAssertLessThan(Date().timeIntervalSince(started), 5)
+        XCTAssertLessThan(Date().timeIntervalSince(started), TestTiming.farAway - 10, "the request ran to the ack timeout")
         XCTAssertEqual(SequencedStubURLProtocol.hits, 2)
     }
 
@@ -303,7 +306,7 @@ final class EnsureStreamLayerTests: XCTestCase {
         let started = Date()
         let task = Task { try await transport.ensureStreamLayer() }
         let watchdog = Task {
-            try await Task.sleep(nanoseconds: 6_000_000_000)
+            try await Task.sleep(nanoseconds: UInt64(TestTiming.farAway * 1_000_000_000))
             task.cancel()
         }
         defer { watchdog.cancel() }
@@ -316,24 +319,26 @@ final class EnsureStreamLayerTests: XCTestCase {
         } catch {
             XCTFail("expected NotConnected, got \(error)")
         }
-        XCTAssertLessThan(Date().timeIntervalSince(started), 5)
+        XCTAssertLessThan(Date().timeIntervalSince(started), TestTiming.hangGuard)
         XCTAssertEqual(SequencedStubURLProtocol.hits, 3) // validate · ensure(401) · validate(막힘)
     }
 
     func testCancellationPropagatesThroughThe401Revalidation() async throws {
         // 검수 실측: 재검증 중의 취소가 NotConnected "token/validate request failed … (취소됨)" 으로 바뀌었다.
-        let transport = try await revalidationStallTransport(ackTimeout: 15)
+        // 취소가 듣지 않으면 ack 시한까지 매달린다 — 그 시한을 조건 대기(hangGuard)보다 멀리(60초) 둔다.
+        let transport = try await revalidationStallTransport(ackTimeout: TestTiming.farAway)
         let task = Task { try await transport.ensureStreamLayer() }
-        try await Task.sleep(nanoseconds: 200_000_000)
+        // 재검증 요청이 나간 뒤에 취소한다(validate · ensure(401) · validate(막힘)) — 고정 대기로는 느린 러너에서 그 전에 취소된다.
+        await TestTiming.until { SequencedStubURLProtocol.hits == 3 }
         task.cancel()
         let done = DoneFlag()
         let outcome = Task { () -> Result<EnsuredStreamLayer, Error> in
             defer { done.set() }
             do { return .success(try await task.value) } catch { return .failure(error) }
         }
-        let deadline = Date().addingTimeInterval(5)
+        let deadline = TestTiming.deadline()
         while Date() < deadline, !done.isSet { try await Task.sleep(nanoseconds: 20_000_000) }
-        guard done.isSet else { return XCTFail("cancellation did not end the revalidation within 5 s") }
+        guard done.isSet else { return XCTFail("cancellation did not end the revalidation within the hang guard") }
         switch await outcome.value {
         case .success: XCTFail("expected CancellationError")
         case .failure(let error): XCTAssertTrue(error is CancellationError, "got \(error)")
@@ -349,16 +354,17 @@ final class EnsureStreamLayerTests: XCTestCase {
         let transport = SocketTransport(options: options, session: URLSession(configuration: config))
         SequencedStubURLProtocol.enqueueStall()
         let task = Task { try await transport.validateForTest() }
-        try await Task.sleep(nanoseconds: 200_000_000)
+        // 요청이 나간 뒤에 취소한다 — 고정 대기 대신 스텁이 요청을 받은 것을 본다.
+        await TestTiming.until { SequencedStubURLProtocol.hits >= 1 }
         task.cancel()
         let done = DoneFlag()
         let outcome = Task { () -> Error? in
             defer { done.set() }
             do { try await task.value; return nil } catch { return error }
         }
-        let deadline = Date().addingTimeInterval(5)
+        let deadline = TestTiming.deadline()
         while Date() < deadline, !done.isSet { try await Task.sleep(nanoseconds: 20_000_000) }
-        guard done.isSet else { return XCTFail("cancellation did not end the validation within 5 s") }
+        guard done.isSet else { return XCTFail("cancellation did not end the validation within the hang guard") }
         let error = await outcome.value
         XCTAssertTrue(error is CancellationError, "got \(String(describing: error))")
     }
@@ -451,7 +457,6 @@ final class EnsureStreamLayerTests: XCTestCase {
         SequencedStubURLProtocol.enqueue(status: 201, body: #"{"layerId":"layer-2","name":"Test Bridge (2)","created":true}"#)
         let result = try await transport.ensureStreamLayer()
         XCTAssertTrue(result.renamed)
-        XCTAssertTrue(result.nameConflict) // 옛 이름 — 트랜스포트를 바로 써도 같은 값
         XCTAssertEqual(result.name, "Test Bridge (2)")
     }
 
@@ -477,7 +482,7 @@ final class EnsureStreamLayerTests: XCTestCase {
         XCTAssertEqual(SequencedStubURLProtocol.hits, 0)
     }
 
-    // ── 클라이언트: nameConflict 판정 ───────────────────────────────────────
+    // ── 클라이언트: renamed 전달 ────────────────────────────────────────────
 
     /// ensure 는 고정 성공, roster 는 주입 — 판정 로직만 격리해서 본다.
     private final class EnsureFakeTransport: Transport, @unchecked Sendable {
@@ -511,8 +516,8 @@ final class EnsureStreamLayerTests: XCTestCase {
         return client
     }
 
-    func testNameConflictIsTheSameAsRenamedAndIgnoresTheRoster() async throws {
-        // roster 판정은 크래시 재시작 뒤 유예 중인 같은 키의 옛 행 · 대기 짝을 충돌로 잘못 셌다(검수) — 이제 renamed 의 옛 이름이다.
+    func testRenamedIgnoresTheRoster() async throws {
+        // roster 판정은 크래시 재시작 뒤 유예 중인 같은 키의 옛 행 · 대기 짝을 충돌로 잘못 셌다(검수).
         let transport = EnsureFakeTransport()
         transport.roster = [
             Member(participantId: "me-1", displayName: "Me"),
@@ -525,7 +530,6 @@ final class EnsureStreamLayerTests: XCTestCase {
         transport.renamed = true
         let renamed = try await client.ensureStreamLayer()
         XCTAssertTrue(renamed.renamed)
-        XCTAssertTrue(renamed.nameConflict)
     }
 
     func testRenamedComesThroughFromTheTransport() async throws {

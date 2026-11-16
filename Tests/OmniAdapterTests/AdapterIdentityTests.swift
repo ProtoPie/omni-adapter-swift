@@ -3,7 +3,7 @@ import XCTest
 
 @testable import OmniAdapter
 
-/// 어댑터 신원(ADR-0016 · D4) — 판 상수가 CHANGELOG 의 맨 위 판과 같은가, 런타임 판별이 맞게 고르는가.
+/// 어댑터 신원 — 판 상수가 CHANGELOG 의 맨 위 판과 같은가, 런타임 판별이 맞게 고르는가.
 /// 정규화 두 함수의 입력별 답은 여섯 언어 공통 벡터(`docs/conformance.json`)가 지킨다(ConformanceTests).
 final class AdapterIdentityTests: XCTestCase {
     func testAdapterVersionMatchesTheTopChangelogHeading() throws {

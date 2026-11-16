@@ -113,12 +113,16 @@ final class StandbyTests: XCTestCase {
     private let otherActive = Member(
         participantId: "other-1", displayName: "unity-screen", standby: false)
 
-    /// 대기 판정이 반영될 때까지 짧게 기다린다(refreshStandby 는 비동기다).
+    /// 대기 판정이 반영될 때까지 기다린다(refreshStandby 는 비동기다) — TestTiming.hangGuard 까지. 종전의 0.4초는 멈춘
+    /// 러너에서 모자랐다. 이미 그 값이면 곧바로 돌아온다.
     private func settle(_ client: ConnectClient, _ want: Bool) async {
-        for _ in 0..<80 {
-            if await client.standby == want { return }
-            try? await Task.sleep(nanoseconds: 5_000_000)
-        }
+        await TestTiming.until(0, pollNanos: 5_000_000) { await client.standby == want }
+    }
+
+    /// 접속 판정이 끝나 창이 닫힐 때까지 기다린다 — 그 뒤의 발행은 직행한다. 고정 50 ms 뒤에 "끝났을 것"이라 보면 느린
+    /// 러너에서 발행이 창 안에 모여(직행하지 않아) 거짓 실패한다.
+    private func judged(_ client: ConnectClient) async throws {
+        try await waitUntil { await !client.judgmentPendingForTest }
     }
 
     func testExclusiveNameMiSingoMyeonGyuchikMiJeokyong() async throws {
@@ -283,7 +287,7 @@ final class StandbyTests: XCTestCase {
         transport.setRoster([meActive])
         let client = ConnectClient(transport: transport, exclusiveName: true)
         try await client.open()
-        try await Task.sleep(nanoseconds: 50_000_000)  // 첫 판정(활성)이 끝나게
+        try await judged(client)  // 첫 판정(활성)이 끝나게
 
         // 백오프 타이머 하나를 걸어 둔다 — 직행 발행이 TooManyRequests 를 받아 큐로 돌아가고 1초 뒤 flush 가 깬다.
         transport.setResult(PublishResult(ok: false, code: "TooManyRequests"))
@@ -383,7 +387,7 @@ final class StandbyTests: XCTestCase {
         transport.setRoster([meActive])
         let client = ConnectClient(transport: transport, exclusiveName: true)
         try await client.open()
-        try await Task.sleep(nanoseconds: 50_000_000)
+        try await judged(client)
 
         transport.setState(.reconnecting)
         try await waitUntil { await client.state == .reconnecting }
@@ -404,7 +408,7 @@ final class StandbyTests: XCTestCase {
         transport.setRoster([meActive])
         let client = ConnectClient(transport: transport, exclusiveName: true)
         try await client.open()
-        try await Task.sleep(nanoseconds: 50_000_000)
+        try await judged(client)
 
         transport.setState(.reconnecting)
         try await waitUntil { await client.state == .reconnecting }
@@ -430,7 +434,7 @@ final class StandbyTests: XCTestCase {
         transport.setRoster([meActive])
         let client = ConnectClient(transport: transport, exclusiveName: true)
         try await client.open()
-        try await Task.sleep(nanoseconds: 50_000_000)
+        try await judged(client)
 
         transport.setState(.reconnecting)
         try await waitUntil { await client.state == .reconnecting }
@@ -456,12 +460,13 @@ final class StandbyTests: XCTestCase {
         transport.setRoster([meActive])
         let client = ConnectClient(transport: transport, exclusiveName: true)
         try await client.open()
-        try await Task.sleep(nanoseconds: 50_000_000)  // 첫 판정(활성)이 끝나게
+        try await judged(client)  // 첫 판정(활성)이 끝나게
 
         let stale = Gate()
         let active = meActive
         let standbyRoster = [meStandby, otherActive]
-        transport.script { await stale.wait(); return [active] }  // 지난 연결 — 늦다
+        let staleAsked = Counter()
+        transport.script { staleAsked.bump(); await stale.wait(); return [active] }  // 지난 연결 — 늦다
         // 새 연결의 판정도 붙잡는다 — 낡은 답의 효과(창 닫기 · flush)가 드러날 틈을 준다(바로 뒤따르면 대기 판정이 큐를 버려 가린다).
         let current = Gate()
         transport.script { await current.wait(); return standbyRoster }
@@ -470,10 +475,14 @@ final class StandbyTests: XCTestCase {
         try await waitUntil { await client.state == .reconnecting }
         try await client.send("a.b", 1)  // 끊긴 동안 → 큐
         transport.setState(.connected)  // 판정 #1(붙잡힘)
-        try await Task.sleep(nanoseconds: 50_000_000)
+        // 판정 #1 이 roster 를 물은(이 연결의 접속 번호를 잡은) 뒤에 끊는다 — 고정 50 ms 로는 느린 러너에서 판정 #1 이 새 연결의
+        // 번호를 잡아 "지난 연결의 답"이 아니게 된다.
+        try await waitUntil { staleAsked.value == 1 }
         transport.setState(.reconnecting)
+        try await waitUntil { await client.state == .reconnecting }
         transport.setState(.connected)  // 새 연결 — 도는 판정이 있으니 그 뒤에 한 번 더(D6)
-        try await Task.sleep(nanoseconds: 50_000_000)
+        // 새 연결이 반영된(창이 다시 열린) 뒤에 지난 답을 푼다 — 그 전에 풀면 그 답이 아직 이 연결의 것이다.
+        try await waitUntil { await client.state == .connected }
 
         await stale.open()  // 지난 연결의 답: 활성 — 버려진다(창도 닫지 않는다)
         try await Task.sleep(nanoseconds: 150_000_000)
@@ -507,8 +516,11 @@ final class StandbyTests: XCTestCase {
         for i in 1...150 { try await client.send("slider", .int(i)) }
         try await Task.sleep(nanoseconds: 100_000_000)
         let early = transport.published.count
-        XCTAssertTrue((30...40).contains(early), "burst 30 + 100ms 동안 찬 몇 개: \(early)")
-        for _ in 0..<500 where transport.published.count < 150 { try await Task.sleep(nanoseconds: 10_000_000) }
+        // 상한은 실제 경과에서 센다 — send 루프도 시간을 쓰므로, 느린 러너에서는 고정 상한 40(burst + 100ms)을 넘는다(CI: 42).
+        let elapsed = Date().timeIntervalSince(started)
+        let ceiling = 30 + Int(60 * elapsed) + 1
+        XCTAssertTrue((30...ceiling).contains(early), "burst 30 + \(Int(elapsed * 1000))ms 동안 찬 몇 개: \(early) (상한 \(ceiling))")
+        try await waitUntil { transport.published.count >= 150 }
         // 나머지 120개는 초당 60개 — 2초. 여유를 둔 하한.
         XCTAssertGreaterThanOrEqual(Date().timeIntervalSince(started), 1.8, "drained too fast for 60/s")
         XCTAssertEqual(transport.published.map { $0.value }, (1...150).map { Primitive.int($0) })
@@ -524,8 +536,12 @@ final class StandbyTests: XCTestCase {
         try await Task.sleep(nanoseconds: 100_000_000)
         let gates = (0...8).map { _ in Gate() }
         let rejected = RejectOnce()
+        // 다시 나가는 발행의 답은 따로 붙잡는다 — 사다리는 flush 의 ack 성공에 내려오므로, 거절 다섯이 모두 처리된 뒤 · 다시 보낸
+        // 것이 성공하기 전의 값을 읽어야 한다. 종전에는 답을 연 뒤 30 ms 쉬고 읽어, 느린 러너에서 거절이 처리되기 전의 0 을 봤다.
+        let resend = Gate()
+        let firstTime = RejectOnce()
         transport.setAckWait { input in
-            if case .int(let v) = input.value { return gates[v] }
+            if case .int(let v) = input.value { return firstTime.first(v) ? gates[v] : resend }
             return nil
         }
         transport.setResultFor { input in
@@ -544,8 +560,10 @@ final class StandbyTests: XCTestCase {
             await gates[v].open()  // 답이 뒤섞여 온다
             try await Task.sleep(nanoseconds: 30_000_000)
         }
+        try await waitUntil { await client.queuedCount == 5 }  // 거절 다섯이 모두 큐로 돌아왔다(다시 나간 것의 답은 붙잡혀 있다)
         let ladder = await client.backoffForTest
         XCTAssertEqual(ladder, 1, "거절 다섯 번 — 사다리는 한 칸(1초)만 올랐다")
+        await resend.open()
         for s in sends { try await bounded(s, seconds: 4) }
         XCTAssertEqual(Array(transport.published.map { $0.value }.dropFirst(8)), [.int(4), .int(5), .int(6), .int(7), .int(8)])
     }
@@ -575,7 +593,8 @@ final class StandbyTests: XCTestCase {
         try await waitUntil { await client.state == .reconnecting }
         try await client.send("a.b", .string("Y"))  // 끊긴 동안 → 큐
         await gate.open()  // D 의 답: NotConnected — 큐로 되돌아온다
-        try await Task.sleep(nanoseconds: 50_000_000)
+        // 되돌아온 것을 본 뒤에 잇는다 — 고정 50 ms 뒤에 이으면 느린 러너에서 Y 가 먼저 나가 [D, Y, D] 가 된다.
+        try await waitUntil { await client.queuedCount == 2 }
         transport.setState(.connected)
         try await bounded(d)
         try await waitUntil { transport.published.count == 3 }
@@ -608,7 +627,7 @@ final class StandbyTests: XCTestCase {
         transport.setState(.connected)  // flush 가 S 를 내보내고 답을 기다린다
         try await waitUntil { transport.published.count == 2 }
         await dGate.open()  // D: TooManyRequests — 큐로, 1초 백오프
-        try await Task.sleep(nanoseconds: 50_000_000)
+        try await waitUntil { await client.queuedCount == 2 }  // D 가 S 앞에 든 뒤에 S 의 답을 연다(고정 50 ms 대신)
         await sGate.open()  // S: 성공
         try await bounded(s)
         try await bounded(d, seconds: 4)
@@ -720,7 +739,9 @@ final class StandbyTests: XCTestCase {
         try await client.send("a.b", 1)  // 직행 → TooManyRequests → 1초 백오프
         let first = await client.backoffForTest
         XCTAssertEqual(first, 1)
-        try await Task.sleep(nanoseconds: 1_300_000_000)  // flush 가 1 을 다시 보낸다(fire-and-forget — 사다리는 그대로)
+        // flush 가 1 을 다시 보낸다(fire-and-forget — 사다리는 그대로). 고정 1.3초 대신 다시 나가 큐가 빈 것을 본다 — 그 전에
+        // 보내면 2 가 직행하지 않고 큐로 가 이 시험이 보려는 것(직행 성공)이 사라진다.
+        try await resent(client, transport, count: 2)
         try await client.send("a.b", 2)  // 직행 성공
         try await waitUntil { transport.published.count == 3 }
         let after = await client.backoffForTest
@@ -735,7 +756,7 @@ final class StandbyTests: XCTestCase {
             transport.setRoster([meActive])
             let client = ConnectClient(transport: transport, exclusiveName: true)
             try await client.open()
-            try await Task.sleep(nanoseconds: 50_000_000)
+            try await judged(client)
             let gate = Gate()
             transport.holdAcks(gate)
             transport.setResult(PublishResult(ok: false, code: code))  // 이 가짜는 내보내는 순간에 결과를 정한다
@@ -777,12 +798,14 @@ final class StandbyTests: XCTestCase {
         try await client.send("a.b", 1)  // 거절 → 1초
         let first = await client.backoffForTest
         XCTAssertEqual(first, 1)
-        try await Task.sleep(nanoseconds: 1_300_000_000)  // 백오프가 끝나고 1 이 다시 나간다(fire-and-forget — 사다리는 그대로)
+        // 백오프가 끝나고 1 이 다시 나간다(fire-and-forget — 사다리는 그대로). 고정 1.3초 뒤에 "끝났을 것"이라 보면 느린 러너에서
+        // 2 가 직행하지 않아(쉬는 중 — 큐로) 거절을 못 받고 사다리가 오르지 않는다.
+        try await resent(client, transport, count: 2)
         for _ in 0..<1_500 { now.bump() }  // 1.5초 뒤 — 같은 구간(2 × 1초 안)
         try await client.send("a.b", 2)
         let second = await client.backoffForTest
         XCTAssertEqual(second, 2)
-        try await Task.sleep(nanoseconds: 2_300_000_000)
+        try await resent(client, transport, count: 4)  // 2초 백오프가 끝나고 2 가 다시 나갔다
         for _ in 0..<5_000 { now.bump() }  // 5초 뒤 = 2초 백오프의 2.5배 — 새 구간(2 × 2초 밖)
         try await client.send("a.b", 3)
         let third = await client.backoffForTest
@@ -812,12 +835,12 @@ final class StandbyTests: XCTestCase {
         for _ in 0..<1_100 { now.bump() }  // 답 왕복 1.1초
         await g1.open()  // 거절 → 1초 백오프
         // 거절이 처리돼 백오프가 걸린 뒤에 시계를 돌린다 — 먼저 돌리면 거절이 그 뒤의 시각을 보고 구간 기준이 어긋났다.
-        for _ in 0..<300 where await client.backoffForTest < 1 { try await Task.sleep(nanoseconds: 10_000_000) }
+        try await waitUntil { await client.backoffForTest >= 1 }
         for _ in 0..<1_000 { now.bump() }  // 그 1초가 지나서 백오프가 끝난다
-        for _ in 0..<300 where transport.published.count < 2 { try await Task.sleep(nanoseconds: 10_000_000) }  // 다시 나간다
+        try await waitUntil { transport.published.count >= 2 }  // 다시 나간다
         for _ in 0..<1_100 { now.bump() }  // 다시 답 왕복 1.1초
         await g2.open()  // 거절 — 백오프가 끝난 지 1.1초(2 × 1초 안) → 같은 구간, 한 칸 오른다
-        for _ in 0..<100 where await client.backoffForTest < 2 { try await Task.sleep(nanoseconds: 10_000_000) }
+        try await waitUntil { await client.backoffForTest >= 2 }
         let ladder = await client.backoffForTest
         XCTAssertEqual(ladder, 2)
         await client.close()
@@ -857,12 +880,14 @@ final class StandbyTests: XCTestCase {
         try await client.open()
         let now = Counter()
         await client.setMonotonicClockForTest { UInt64(1_000 + now.value) * 1_000_000 }
-        let push = await client.throttle("nav.x", hz: 10)  // 100ms
+        // 간격을 60초로 둔다 — 벽시계를 읽는 결함이면 둘째 값은 60초 뒤의 타이머로 나가 아래 조건 대기(hangGuard)에 걸린다.
+        // 종전에는 100 ms 간격에 40 ms 를 쉬고 봤다 — 느린 러너에서 곧바로 나간 값이 40 ms 안에 닿지 않아 거짓 실패한다.
+        let push = await client.throttle("nav.x", hz: 1 / TestTiming.farAway)
         try push(.int(1))  // 첫 값은 곧바로
         try await waitUntil { transport.published.count == 1 }
-        for _ in 0..<1000 { now.bump() }  // 단조 시계로 1초 뒤
+        for _ in 0..<61_000 { now.bump() }  // 단조 시계로 61초 뒤
         try push(.int(2))  // 간격이 지났다 — 곧바로 나간다(타이머를 기다리지 않는다)
-        try await Task.sleep(nanoseconds: 40_000_000)
+        try await waitUntil { transport.published.count == 2 }
         XCTAssertEqual(transport.published.map { $0.value }, [.int(1), .int(2)])
     }
 
@@ -884,7 +909,8 @@ final class StandbyTests: XCTestCase {
         try await waitUntil { await client.state == .reconnecting }
         try await client.send("a.b", 2)  // 끊긴 동안 → 큐
         await gate.open()  // 1 의 답: TooManyRequests — 큐 맨 앞으로, 1초 백오프
-        try await Task.sleep(nanoseconds: 50_000_000)
+        // 되돌아온 것을 본 뒤에 잇는다 — 고정 50 ms 뒤에 이으면 느린 러너에서 2 가 먼저 나가 [1, 2, 1] 이 된다.
+        try await waitUntil { await client.queuedCount == 2 }
         transport.setState(.connected)
         try await bounded(first, seconds: 4)
         try await waitUntil { transport.published.count == 3 }
@@ -898,10 +924,13 @@ final class StandbyTests: XCTestCase {
         let client = ConnectClient(transport: transport, exclusiveName: false)
         try await client.open()
         try await Task.sleep(nanoseconds: 700_000_000)  // 상한이 60이면 30 + 0.7초 × 60 = 72 → 60까지 찼을 것이다
+        let started = Date()
         for i in 1...60 { try await client.send("slider", .int(i)) }
         let early = transport.published.count
-        XCTAssertTrue(
-            (ConnectClient.messageBurst...(ConnectClient.messageBurst + 3)).contains(early), "early=\(early)")
+        // 상한은 실제 경과에서 센다 — send 루프가 쓰는 시간만큼 토큰이 다시 찬다(초당 60). 고정 +3(50 ms)은 느린 러너에서 넘는다.
+        let elapsed = Date().timeIntervalSince(started)
+        let ceiling = ConnectClient.messageBurst + Int(60 * elapsed) + 3
+        XCTAssertTrue((ConnectClient.messageBurst...ceiling).contains(early), "early=\(early) (ceiling \(ceiling))")
     }
 
     func testJaejeopsokHamyeonTokeniDasiGadeukChanda() async throws {
@@ -909,13 +938,16 @@ final class StandbyTests: XCTestCase {
         let client = ConnectClient(transport: transport, exclusiveName: false)
         try await client.open()
         let burst = ConnectClient.messageBurst
+        // 단조 시계를 멈춰 둔다 — 토큰은 다시 잇는 것으로만 찬다. 실제 시계로 "150 ms 안에 burst 개"를 재던 종전에는 느린
+        // 러너에서 그 안에 다 나가지 못해 거짓 실패했고, 넉넉히 기다리면 다시 채우지 않는 결함도 0.5초 뒤에는 같은 수가 됐다.
+        await client.setMonotonicClockForTest { 1_000_000_000 }
         for i in 0..<burst { try await client.send("burn", .int(i)) }  // 토큰을 다 쓴다
         transport.setState(.reconnecting)
         try await waitUntil { await client.state == .reconnecting }
         for i in 1...burst { try await client.send("after", .int(i)) }  // 끊긴 동안 burst 개
         transport.setState(.connected)  // 서버의 한도는 소켓마다 새로 — burst 개가 곧바로 나간다
-        try await Task.sleep(nanoseconds: 150_000_000)
-        // 다시 채우지 않았다면 150ms 동안 찬 몇 개(≈9)만 나갔을 것이다.
+        // 다시 채우지 않았다면 (시계가 멈춰 있으니) 하나도 나가지 않는다.
+        try await waitUntil { transport.published.filter { $0.channel == "after" }.count == burst }
         XCTAssertEqual(transport.published.filter { $0.channel == "after" }.count, burst)
     }
 
@@ -1036,7 +1068,7 @@ final class StandbyTests: XCTestCase {
         transport.setRoster([meActive])
         let client = ConnectClient(transport: transport, queueLimit: 3, exclusiveName: true)
         try await client.open()
-        try await Task.sleep(nanoseconds: 50_000_000)
+        try await judged(client)
         let events = await client.events()
         let dropped = Box2<[String]>()
         dropped.set([])
@@ -1068,10 +1100,10 @@ final class StandbyTests: XCTestCase {
         var value: Int { lock.withLock { count } }
     }
 
-    /// 기한 안에 끝나기를 기다린다 — 결함이 있으면 매달리지 않고 실패한다.
+    /// 기한 안에 끝나기를 기다린다 — 결함이 있으면 매달리지 않고 실패한다. 기한은 TestTiming.hangGuard 이상이다.
     @discardableResult
     private func bounded<T: Sendable>(_ task: Task<T, Error>, seconds: Double = 3) async throws -> T {
-        let deadline = Date().addingTimeInterval(seconds)
+        let deadline = TestTiming.deadline(seconds)
         let done = Box2<T>()
         Task { done.set(try? await task.value) }
         while done.get() == nil && Date() < deadline { try await Task.sleep(nanoseconds: 10_000_000) }
@@ -1104,13 +1136,22 @@ final class StandbyTests: XCTestCase {
         }
     }
 
-    private func waitUntil(_ condition: () async -> Bool) async throws {
-        for _ in 0..<200 {
-            if await condition() { return }
-            try await Task.sleep(nanoseconds: 10_000_000)
+    /// 조건이 참이 될 때까지 — TestTiming.hangGuard 까지(종전의 2초는 멈춘 러너에서 모자랐다).
+    private func waitUntil(
+        file: StaticString = #filePath, line: UInt = #line, _ condition: () async -> Bool
+    ) async throws {
+        let met = await TestTiming.until(0, pollNanos: 5_000_000, condition)
+        XCTAssertTrue(met, "condition not met within timeout", file: file, line: line)
+    }
+
+    /// 백오프가 끝나 큐에 든 것이 다시 나갔다 — 발행이 `count` 건이 되고, 큐가 비고, 쉬는 중이 아니다(다음 발행이 직행한다).
+    private func resent(_ client: ConnectClient, _ transport: FakeTransport, count: Int) async throws {
+        try await waitUntil {
+            guard transport.published.count >= count else { return false }
+            let queued = await client.queuedCount
+            let pending = await client.backoffPendingForTest
+            return queued == 0 && !pending
         }
-        let met = await condition()
-        XCTAssertTrue(met, "condition not met within timeout")
     }
 
     func testJoyonghanJaejoinEseodoDaegiReulAnda() async throws {
@@ -1141,9 +1182,10 @@ final class StandbyTests: XCTestCase {
         try await client.open()
 
         transport.setState(.reconnecting)
-        try await Task.sleep(nanoseconds: 30_000_000)
+        // 끊김이 반영된 뒤에 보낸다 — 고정 30 ms 뒤에 보내면 느린 러너에서 직행해 아래 0 이 깨진다.
+        try await waitUntil { await client.state == .reconnecting }
         let queued = Task { try await client.send("a.b", 42) }
-        try await Task.sleep(nanoseconds: 60_000_000)
+        try await waitUntil { await client.queuedCount == 1 }
         XCTAssertEqual(transport.published.count, 0, "끊긴 동안에는 나가지 않는다")
 
         // 끊긴 사이 다른 인스턴스가 활성을 가져갔다.
@@ -1175,7 +1217,7 @@ final class StandbyTests: XCTestCase {
         transport.setRoster([meActive])
         let client = ConnectClient(transport: transport, exclusiveName: true)
         try await client.open()
-        try await Task.sleep(nanoseconds: 50_000_000)  // 첫 판정(활성)이 끝나게
+        try await judged(client)  // 첫 판정(활성)이 끝나게
 
         transport.setState(.reconnecting)
         try await waitUntil { await client.state == .reconnecting }
@@ -1235,7 +1277,7 @@ final class StandbyTests: XCTestCase {
             transport.setRoster([meActive])
             let client = ConnectClient(transport: transport, exclusiveName: true)
             try await client.open()
-            try await Task.sleep(nanoseconds: 50_000_000)
+            try await judged(client)
 
             transport.setState(.reconnecting)
             try await waitUntil { await client.state == .reconnecting }
@@ -1274,7 +1316,7 @@ final class StandbyTests: XCTestCase {
         transport.setRoster([meActive])
         let client = ConnectClient(transport: transport, exclusiveName: true)
         try await client.open()
-        try await Task.sleep(nanoseconds: 50_000_000)
+        try await judged(client)
 
         transport.setState(.reconnecting)
         try await waitUntil { await client.state == .reconnecting }

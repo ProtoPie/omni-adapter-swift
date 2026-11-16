@@ -2,7 +2,7 @@ import XCTest
 @testable import OmniAdapter
 
 /// 프로토콜 드리프트 가드 — 같은 repo 의 TS 어댑터 `protocol.ts` 와 상수 대조.
-/// TS 어댑터가 connect-v2 원본(`@ppc/protocol`)과의 드리프트를 감시하므로, 여기서
+/// TS 어댑터가 서버 원본과의 드리프트를 감시하므로, 여기서
 /// TS 어댑터와 잠그면 이행적으로 서버 계약과 잠긴다. TS 소스가 없으면(독립 배포
 /// 체크아웃) 검사를 건너뛴다.
 ///
@@ -162,7 +162,7 @@ final class ProtocolDriftTests: XCTestCase {
         }
     }
 
-    /// 어댑터 키 길이 · 429/503 봉투의 retryAfterMs 이름 · about 필드 · 능력 플래그 — TS protocol.ts 와 대조(connect-v2 3464e4c4f · 8fea9402d).
+    /// 어댑터 키 길이 · 429/503 봉투의 retryAfterMs 이름 · about 필드 · 능력 플래그 — TS protocol.ts 와 대조.
     func testAdapterKeyLengthRetryAfterAndAboutFieldsLockstep() throws {
         let src = try tsSource()
         XCTAssertTrue(src.contains("ADAPTER_KEY_LENGTH = \(Protocol.adapterKeyLength);"))
@@ -238,7 +238,7 @@ final class ProtocolDriftTests: XCTestCase {
         }
     }
 
-    /// 어댑터 신원(ADR-0016 · D4) — 이 언어가 보내는 언어 · 런타임 값이 TS 어휘(서버와 대조된다) 안이고, 두 판 패턴이
+    /// 어댑터 신원 — 이 언어가 보내는 언어 · 런타임 값이 TS 어휘(서버와 대조된다) 안이고, 두 판 패턴이
     /// TS 와 같으며, 필드 이름 넷이 TS 필드 목록에 있다. 어휘 밖의 값은 서버가 받지 않는다.
     func testAdapterIdentityLockstep() throws {
         let src = try tsSource()
@@ -587,7 +587,7 @@ final class SocketTransportUnitTests: XCTestCase {
         XCTAssertEqual(SocketTransport.mapValidateError(status: 400, code: nil, base: "http://h").code, "ValidationError")
         XCTAssertEqual(SocketTransport.mapValidateError(status: 500, code: "Boom", base: "http://h").code, "Boom")
         XCTAssertEqual(SocketTransport.mapValidateError(status: 500, code: nil, base: "http://h").code, "Unauthorized")
-        // 503 KeyMaterialUnavailable(connect-v2 8fea9402d)만 가른다 — 다른 503 은 종전대로 폴스루.
+        // 503 KeyMaterialUnavailable 만 가른다 — 다른 503 은 종전대로 폴스루.
         let material = SocketTransport.mapValidateError(
             status: 503, code: "KeyMaterialUnavailable", base: "http://h", details: ["retryAfterMs": 1500])
         XCTAssertEqual(material.code, "KeyMaterialUnavailable")
@@ -679,7 +679,7 @@ final class SocketTransportUnitTests: XCTestCase {
         XCTAssertEqual(SocketTransport.describeValidationIssues([["path": ["token"]]]), "token")
     }
 
-    /// 401 인데 키 길이가 46 이 아니면 힌트가 "잘린 키" 를 말한다 — 서버는 길이로 키 경로를 가른다(connect-v2 8fea9402d). 호출부
+    /// 401 인데 키 길이가 46 이 아니면 힌트가 "잘린 키" 를 말한다 — 서버는 길이로 키 경로를 가른다. 호출부
     /// (validate)의 배선이라 순수 매퍼로는 못 잡는다.
     func testTruncatedKey401HintThroughOpen() async {
         func openError(status: Int, body: String, secretKey: String) async -> AdapterError? {

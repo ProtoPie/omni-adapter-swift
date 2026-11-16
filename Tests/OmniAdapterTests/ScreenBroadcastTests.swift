@@ -65,7 +65,8 @@ final class ScreenBroadcastTests: XCTestCase {
             set { lock.withLock { iceFailsStorage = newValue } }
         }
         func fetchIceServers() async -> IceServersResult {
-            if iceHangs { try? await Task.sleep(nanoseconds: 30_000_000_000) }
+            // 답하지 않는 조회 — 조건 대기(TestTiming.hangGuard)보다 넉넉히 길게 붙잡는다.
+            if iceHangs { try? await Task.sleep(nanoseconds: UInt64(TestTiming.farAway * 1_000_000_000)) }
             if iceFails { return .lookupFailed }
             if let list = iceList { return IceServersResult(iceServers: list, expiresAt: 1) }
             let delay = iceDelayMs
@@ -223,21 +224,37 @@ final class ScreenBroadcastTests: XCTestCase {
         return client
     }
 
+    /// 고정 대기 — "아무 일도 일어나지 않았다 / 더 늘지 않는다"를 보기 전에만 쓴다. 긍정 결과(answer 가 나갔다 · 세션이 닫혔다 ·
+    /// 포인터가 닿았다 …)는 waitUntil · answered · until 로 기다린다: 헬퍼의 일은 태스크 여럿을 건너가므로, 고정 대기 뒤에
+    /// "끝났을 것"이라 보면 느린 러너에서 거짓 실패한다(TestTiming). 송출 시작 직후의 settle() 은 남겨 둔 습관일 뿐이다 —
+    /// startScreenBroadcast 는 ready 를 보낸 뒤에 돌아온다.
     private func settle(_ ms: UInt64 = 150) async {
         try? await Task.sleep(nanoseconds: ms * 1_000_000)
     }
 
-    /// 조건이 참이 될 때까지 짧게 폴링한다 — 벽시계 간격 대신 관측으로 순서를 세운다(시한을 넘기면 실패).
+    /// 조건이 참이 될 때까지 폴링한다 — 벽시계 간격 대신 관측으로 순서를 세운다(시한을 넘기면 실패). 시한은
+    /// TestTiming.hangGuard 이상이다 — 참이 되면 곧바로 돌아온다.
     private func waitUntil(
         timeout: TimeInterval = 5, file: StaticString = #filePath, line: UInt = #line, _ condition: () async -> Bool
     ) async throws {
-        let deadline = Date().addingTimeInterval(timeout)
-        while Date() < deadline {
-            if await condition() { return }
-            try await Task.sleep(nanoseconds: 5_000_000)
-        }
+        let timeout = TestTiming.atLeastHangGuard(timeout)
+        if await TestTiming.until(timeout, condition) { return }
         XCTFail("condition not met within \(timeout) s", file: file, line: line)
         throw AdapterError("Timeout", "waitUntil")
+    }
+
+    /// answer 가 `count` 건 나갈 때까지 — answer 는 한 협상의 마지막 걸음이다(세션은 그 전에 올라가 있다).
+    private func answered(
+        _ transport: FakeTransport, _ count: Int, file: StaticString = #filePath, line: UInt = #line
+    ) async throws {
+        try await waitUntil(file: file, line: line) { transport.answers.count >= count }
+    }
+
+    /// ready 가 `count` 번 나갈 때까지.
+    private func announced(
+        _ transport: FakeTransport, _ count: Int, file: StaticString = #filePath, line: UInt = #line
+    ) async throws {
+        try await waitUntil(file: file, line: line) { transport.kinds.filter { $0 == "ready" }.count >= count }
     }
 
     /// 뷰어가 offer 에 실은 협상 번호(문자열 · 숫자)를 answer 와 그 협상의 ICE 에 그대로 돌려준다 — 뷰어는 다른 협상의 답을
@@ -260,16 +277,12 @@ final class ScreenBroadcastTests: XCTestCase {
         numbered["negotiationId"] = 42
         transport.signal(numbered)
         transport.signal(Self.offer("v3"))
-        var waited = 0
-        while transport.answers.count < 3, waited < 60 {
-            await settle(50)
-            waited += 1
-        }
+        try await answered(transport, 3)
         guard transport.answers.count == 3, wiring.count == 3 else {
             return XCTFail("answers \(transport.answers.count), sessions \(wiring.count)")
         }
         for i in 0..<3 { wiring.sendIce(i)?(["candidate": "c\(i)"]) }
-        await settle(200)
+        try await waitUntil { transport.kinds.filter { $0 == "ice" }.count == 3 }
 
         func frame(_ kind: String, to viewer: String) -> [String: Any]? {
             transport.sent.first { ($0["kind"] as? String) == kind && ($0["targetParticipantId"] as? String) == viewer }
@@ -296,7 +309,7 @@ final class ScreenBroadcastTests: XCTestCase {
         await b.sourceChanged()
         XCTAssertEqual(transport.kinds.filter { $0 == "ready" }.count, 2)
         transport.setState(.reconnecting)
-        await settle()
+        try await waitUntil { await client.state == .reconnecting }
         await b.sourceChanged()
         XCTAssertEqual(transport.kinds.filter { $0 == "ready" }.count, 2, "끊긴 동안 ready 를 보냈다")
         await b.stop()
@@ -341,7 +354,7 @@ final class ScreenBroadcastTests: XCTestCase {
         // 빠른 재접속 — 상태 스냅샷을 보면 이 창에서 재알림이 사라진다.
         transport.setState(.reconnecting)
         transport.setState(.connected)
-        await settle(250)
+        _ = await TestTiming.until { transport.kinds.filter { $0 == "ready" }.count > before }
         let after = transport.kinds.filter { $0 == "ready" }.count
         XCTAssertGreaterThan(after, before, "재접속에서도 다시 알려야 한다")
         await b.stop()
@@ -366,11 +379,11 @@ final class ScreenBroadcastTests: XCTestCase {
             for i in 0..<300 { h.onMemberJoin?(Member(participantId: "m\(round)-\(i)", displayName: "viewer")) }
         }
         // 클라이언트가 전이를 다 처리할 때까지 헬퍼를 붙잡아 둔다 — 그 사이 events() 에는 6만 건이 몰렸다.
-        let flooded = Date().addingTimeInterval(20)
+        let flooded = TestTiming.deadline()
         while transitions.peek < 2 * rounds, Date() < flooded { try await Task.sleep(nanoseconds: 5_000_000) }
         counter?.cancel()
         release.signal()
-        let deadline = Date().addingTimeInterval(20)
+        let deadline = TestTiming.deadline()
         while transport.kinds.filter({ $0 == "ready" }).count < readyBefore + rounds, Date() < deadline {
             await settle(20)
         }
@@ -389,7 +402,7 @@ final class ScreenBroadcastTests: XCTestCase {
         await settle()
 
         transport.signal(Self.offer("viewer-1"))
-        await settle(250)
+        try await answered(transport, 1)
         XCTAssertEqual(transport.answers.count, 1)
         let answer = transport.answers[0]
         XCTAssertEqual(answer["targetParticipantId"] as? String, "viewer-1")
@@ -410,9 +423,16 @@ final class ScreenBroadcastTests: XCTestCase {
     func testNoSessionMeansNoAnswer() async throws {
         let transport = FakeTransport()
         let client = try await openClient(transport)
-        let b = await startScreenBroadcast(client: client, createSession: { _, _, _, _ in nil })
+        let asked = CallCounter()
+        let b = await startScreenBroadcast(client: client, createSession: { _, _, _, _ in
+            _ = asked.next()
+            return nil
+        })
         await settle()
         transport.signal(Self.offer("viewer-1"))
+        // 팩토리가 불린(이 offer 가 처리된) 뒤 그 세대 항목이 치워질 때까지 — 고정 대기로는 치우기 전의 1 을 볼 수 있다.
+        try await waitUntil { asked.peek == 1 }
+        try await waitUntil { await b.generationCount == 0 }
         await settle(250)
         XCTAssertEqual(transport.answers.count, 0, "보낼 화면이 없으면 답하지 않는다")
         let count = await b.viewerCount
@@ -435,10 +455,10 @@ final class ScreenBroadcastTests: XCTestCase {
             })
         await settle()
         transport.signal(Self.offer("viewer-1"))
-        await settle(250)
+        try await answered(transport, 1)
 
         publishBox.get()?(["candidate": "cand-local"])
-        await settle()
+        try await waitUntil { transport.kinds.contains("ice") }
         let ice = transport.sent.filter { ($0["kind"] as? String) == "ice" }
         XCTAssertEqual(ice.count, 1)
         XCTAssertEqual(ice[0]["targetParticipantId"] as? String, "viewer-1")
@@ -447,7 +467,7 @@ final class ScreenBroadcastTests: XCTestCase {
             "kind": "ice", "fromParticipantId": "viewer-1",
             "candidate": ["candidate": "cand-remote"],
         ])
-        await settle()
+        try await waitUntil { session.candidates.count == 1 }
         XCTAssertEqual(session.candidates.count, 1)
         await b.stop()
     }
@@ -462,14 +482,14 @@ final class ScreenBroadcastTests: XCTestCase {
             createSession: { viewer, _, _, _ in viewer == "viewer-1" ? s1 : s2 })
         await settle()
         transport.signal(Self.offer("viewer-1"))
-        await settle(200)
+        try await answered(transport, 1)
         transport.signal(Self.offer("viewer-2"))
-        await settle(250)
+        try await answered(transport, 2)
         var count = await b.viewerCount
         XCTAssertEqual(count, 2)
 
         transport.signal(["kind": "peer-left", "participantId": "viewer-1"])
-        await settle(200)
+        try await waitUntil { s1.closed }
         count = await b.viewerCount
         XCTAssertEqual(count, 1)
         XCTAssertTrue(s1.closed)
@@ -490,9 +510,9 @@ final class ScreenBroadcastTests: XCTestCase {
             onError: { _, viewer in errors.add(viewer) })
         await settle()
         transport.signal(Self.offer("bad"))
-        await settle(200)
+        try await waitUntil { errors.all == ["bad"] }
         transport.signal(Self.offer("good"))
-        await settle(300)
+        try await answered(transport, 1)
 
         XCTAssertEqual(errors.all, ["bad"])
         let count = await b.viewerCount
@@ -516,7 +536,9 @@ final class ScreenBroadcastTests: XCTestCase {
             onRemoteInput: { pointer, _ in got.add(pointer) })
         await settle()
         transport.signal(Self.offer("viewer-1"))
-        await settle(250)
+        // answer 가 나가고 채널이 붙어 hello 가 나갈 때까지(채널 배선은 따로 도는 태스크다).
+        try await answered(transport, 1)
+        try await waitUntil { !channel.sent.isEmpty }
         return (b, channel)
     }
 
@@ -537,12 +559,12 @@ final class ScreenBroadcastTests: XCTestCase {
         await b.setHelloReannounceMs(30) // 10초를 기다릴 수는 없다
         await settle()
         transport.signal(Self.offer("viewer-1"))
-        await settle(120)
+        _ = await TestTiming.until { !channel.sent.isEmpty }
         // 정확한 횟수는 시간 경합이라 세지 않는다 — "보냈다"와 "계속 늘어난다"만 본다.
         let initial = channel.sent.count
         XCTAssertGreaterThanOrEqual(initial, 1, "개설 즉시 hello 가 나가야 한다")
 
-        await settle(150)
+        _ = await TestTiming.until { channel.sent.count >= initial + 2 }
         XCTAssertGreaterThanOrEqual(
             channel.sent.count, initial + 2,
             "재알림이 이어져야 한다 (\(initial) → \(channel.sent.count))")
@@ -569,17 +591,17 @@ final class ScreenBroadcastTests: XCTestCase {
             onRemoteInput: { _, _ in })
         await settle()
         transport.signal(Self.offer("viewer-1"))
-        await settle(250)
+        _ = await TestTiming.until { client.diagnostics().contains { $0.code == "hello" } }
 
         let codes = client.diagnostics().map(\.code)
         XCTAssertTrue(codes.contains("input-channel"), "채널 개설이 링에 남아야 한다")
         XCTAssertTrue(codes.contains("hello"), "hello 첫 송신이 링에 남아야 한다")
 
         transport.holder("someone-else")
-        await settle(80)
         channel.push(#"{"t":"down","p":0,"x":0.5,"y":0.5}"#)
         channel.push(#"{"t":"down","p":0,"x":0.5,"y":0.5}"#)
-        await settle(120)
+        _ = await TestTiming.until { client.diagnostics().contains { $0.code == "input-dropped" } }
+        await settle(120)  // 둘째 프레임이 한 줄을 더 남기지 않는지 볼 창
         let dropped = client.diagnostics().filter { $0.code == "input-dropped" }.count
         XCTAssertEqual(dropped, 1, "(뷰어,사유)당 1회")
         await b.stop()
@@ -606,7 +628,7 @@ final class ScreenBroadcastTests: XCTestCase {
         transport.holder("viewer-1")
         await settle(80)
         channel.push(#"{"t":"down","p":0,"x":0.5,"y":0.5}"#)
-        await settle(80)
+        try await waitUntil { got.all.count == 1 }
         XCTAssertEqual(got.all.count, 1)
         XCTAssertEqual(got.all[0].t, "down")
         await b.stop()
@@ -623,7 +645,7 @@ final class ScreenBroadcastTests: XCTestCase {
         let (b, channel) = try await wiredInput(transport, got)
 
         channel.push(#"{"t":"down","p":0,"x":0.5,"y":0.5}"#)
-        await settle(80)
+        _ = await TestTiming.until { got.all.count == 1 }
         XCTAssertEqual(got.all.count, 1, "리스 없는 배포에서 포인터가 흘러야 한다")
         XCTAssertEqual(got.all[0].t, "down")
         await b.stop()
@@ -636,13 +658,15 @@ final class ScreenBroadcastTests: XCTestCase {
         let got = PointerBox()
         let (b, channel) = try await wiredInput(transport, got)
 
+        // 통지와 누름을 잇달아 넣는다 — 프레임은 그 앞의 통지가 적용된 뒤에 처리된다(헬퍼가 그 순서를 지킨다). 종전에는
+        // 사이에 40 ms 를 쉬었는데, 그 쉼이 러너 부하로 ttl(300 ms)을 넘기면 누름이 만료 뒤에 닿아 버려졌다.
         transport.holder("viewer-1", ttlMs: 300)
-        await settle(40)
         channel.push(#"{"t":"down","p":1,"x":0.5,"y":0.5}"#)
-        await settle(40)
+        try await waitUntil { got.all.count == 1 }
         XCTAssertEqual(got.all.count, 1)
-        await settle(500)  // renew 가 통지를 갱신하지 못했다
-        // 만료 후 입력은 폐기 + 열린 포인터는 cancel 합성
+        // renew 가 통지를 갱신하지 못했다 — ttl 이 지나면 열린 포인터에 cancel 을 합성한다(그때까지 기다린다).
+        try await waitUntil { got.all.count == 2 }
+        // 만료 후 입력은 폐기
         channel.push(#"{"t":"move","p":1,"x":0.6,"y":0.5}"#)
         await settle(80)
         XCTAssertEqual(got.all.count, 2)
@@ -661,7 +685,7 @@ final class ScreenBroadcastTests: XCTestCase {
         channel.push(#"{"t":"down","p":1,"x":0.5,"y":0.5}"#)
         await settle(200) // 종전에는 0ms 타이머가 여기서 보유자를 내렸다
         channel.push(#"{"t":"move","p":1,"x":0.6,"y":0.5}"#)
-        await settle(80)
+        _ = await TestTiming.until { got.all.count == 2 }
         XCTAssertEqual(got.all.map(\.t), ["down", "move"])
         await b.stop()
     }
@@ -676,7 +700,7 @@ final class ScreenBroadcastTests: XCTestCase {
         // up 으로 보낸다 — down 을 남기면 하강 통지가 cancel 을 합성해(N7) 건수가
         // 하나 늘고, 그게 "게이트가 열렸다"로 오독된다.
         channel.push(#"{"t":"up","p":0,"x":0.5,"y":0.5}"#)
-        await settle(80)
+        try await waitUntil { got.all.count == 1 }
         XCTAssertEqual(got.all.count, 1)
 
         transport.holder(nil)
@@ -717,7 +741,7 @@ final class ScreenBroadcastTests: XCTestCase {
         transport.holder("viewer-1")
         await settle(80)
         channel.push(#"{"t":"move","p":0,"x":-3.0,"y":9.0}"#)
-        await settle(120)
+        try await waitUntil { got.all.count == 1 }
         XCTAssertEqual(got.all.count, 1)
         XCTAssertEqual(got.all[0].x, 0)
         XCTAssertEqual(got.all[0].y, 1)
@@ -731,12 +755,12 @@ final class ScreenBroadcastTests: XCTestCase {
         transport.holder("viewer-1")
         await settle(80)
         channel.push(#"{"t":"down","p":7,"x":0.25,"y":0.75}"#)
-        await settle(120)
+        try await waitUntil { got.all.count == 1 }
         XCTAssertEqual(got.all.count, 1)
 
         // 조작권 회수 — 누른 채 잃으면 앱이 영영 눌린 상태로 남는다(N7).
         transport.holder(nil)
-        await settle(150)
+        _ = await TestTiming.until { got.all.count == 2 }
         XCTAssertEqual(got.all.count, 2, "cancel 이 합성되어야 한다")
         XCTAssertEqual(got.all[1].t, "cancel")
         XCTAssertEqual(got.all[1].p, 7)
@@ -747,7 +771,7 @@ final class ScreenBroadcastTests: XCTestCase {
 
     /// 적용한 보유자 통지가 `applied` 건이 될 때까지(배달 방식과 무관한 신호).
     private func waitForHolderNotices(_ b: ScreenBroadcast, applied: Int, timeout: TimeInterval = 5) async {
-        let deadline = Date().addingTimeInterval(timeout)
+        let deadline = TestTiming.deadline(timeout)
         while await b.appliedHolderNoticeCount < applied, Date() < deadline {
             try? await Task.sleep(nanoseconds: 1_000_000)
         }
@@ -778,7 +802,7 @@ final class ScreenBroadcastTests: XCTestCase {
         transport.holder("viewer-1")
         await waitForHolderNotices(b, applied: 2)
         channel.push(#"{"t":"down","p":0,"x":0.5,"y":0.5}"#)
-        await settle(80)
+        _ = await TestTiming.until { got.all.count == 1 }
         XCTAssertEqual(got.all.count, 1, "교대 뒤의 보유자 입력이 막혔다")
         let holder = await b.currentHolder
         XCTAssertEqual(holder, "viewer-1")
@@ -830,7 +854,7 @@ final class ScreenBroadcastTests: XCTestCase {
         let notes = client.diagnostics().filter { $0.message.hasPrefix("holder notices:") }
         XCTAssertEqual(notes.map(\.code), ["queue-overflow"], "밀림 한 번에 한 줄")
         release.signal()
-        let deadline = Date().addingTimeInterval(5)
+        let deadline = TestTiming.deadline(5)
         while await !b.holderNoticesSettled, Date() < deadline { try await Task.sleep(nanoseconds: 1_000_000) }
         let holder = await b.currentHolder
         XCTAssertEqual(holder, "final", "넘친 뒤 옛 통지가 보유자를 정했다")
@@ -844,7 +868,7 @@ final class ScreenBroadcastTests: XCTestCase {
         let (b, _, _, release, _) = try await blockedInput(transport) { b, _, _, client in
             _ = try await client.submitRegistrationCode("CODE") // 내 등록 = r1
             transport.holder("viewer-1")
-            let deadline = Date().addingTimeInterval(3)
+            let deadline = TestTiming.deadline(3)
             while await b.currentHolder != "viewer-1", Date() < deadline { try await Task.sleep(nanoseconds: 1_000_000) }
         }
         for i in 0..<300 { transport.holder("x\(i)", registrationId: "r-other") }
@@ -852,7 +876,7 @@ final class ScreenBroadcastTests: XCTestCase {
         transport.holder(nil) // 내 등록의 회수
         XCTAssertEqual(b.pendingHolderNoticeCount, 1)
         release.signal()
-        let deadline = Date().addingTimeInterval(5)
+        let deadline = TestTiming.deadline(5)
         while await !b.holderNoticesSettled, Date() < deadline { try await Task.sleep(nanoseconds: 1_000_000) }
         let holder = await b.currentHolder
         XCTAssertNil(holder)
@@ -865,14 +889,14 @@ final class ScreenBroadcastTests: XCTestCase {
         let transport = FakeTransport()
         let (b, _, got, release, client) = try await blockedInput(transport) { b, channel, got, _ in
             transport.holder("viewer-1")
-            let deadline = Date().addingTimeInterval(3)
+            let deadline = TestTiming.deadline(3)
             while await b.currentHolder != "viewer-1", Date() < deadline { try await Task.sleep(nanoseconds: 1_000_000) }
             channel.push(Self.pointerFrame("down", 7)) // 누른 채
             while got.all.count < 1, Date() < deadline { try await Task.sleep(nanoseconds: 1_000_000) }
         }
         for _ in 0..<600 { transport.holder("viewer-1") } // renew 가 밀렸다
         release.signal()
-        let deadline = Date().addingTimeInterval(5)
+        let deadline = TestTiming.deadline(5)
         while await !b.holderNoticesSettled, Date() < deadline { try await Task.sleep(nanoseconds: 1_000_000) }
         await settle(50)
         XCTAssertFalse(got.all.contains { $0.t == "cancel" }, "밀린 renew 가 보유자를 흔들어 누름을 닫았다")
@@ -912,11 +936,13 @@ final class ScreenBroadcastTests: XCTestCase {
             })
         await settle()
         transport.signal(Self.offer("viewer-1"))
-        await settle(250)
+        try await answered(transport, 1)
+        try await waitUntil { !channel.sent.isEmpty }  // 채널이 붙었다(hello 가 나갔다)
         transport.holder("viewer-1")
-        let deadline = Date().addingTimeInterval(3)
+        let deadline = TestTiming.deadline(3)
         while await b.currentHolder != "viewer-1", Date() < deadline { try await Task.sleep(nanoseconds: 1_000_000) }
         dataThread.sync { for i in 0..<20 { channel.push(Self.pointerFrame("move", 0, Double(i) / 1000)) } }
+        try await waitUntil { revoked.value }  // 회수 장면이 실제로 돌았다 — 그 뒤 더 닿는 것이 없는지 본다
         await settle(400)
         let afterRevoke = got.all.filter { Int(($0.x * 1000).rounded()) >= 100 }.count
         XCTAssertEqual(afterRevoke, 0, "회수 뒤에 도착한 옛 보유자의 프레임이 앱에 닿았다")
@@ -941,11 +967,12 @@ final class ScreenBroadcastTests: XCTestCase {
             })
         await settle()
         transport.signal(Self.offer("viewer-1"))
-        await settle(250)
+        try await answered(transport, 1)
+        try await waitUntil { !channel.sent.isEmpty }  // 채널이 붙었다(hello 가 나갔다)
         var leaked: [Int] = []
         for _ in 0..<5 {
             transport.holder("viewer-1")
-            let deadline = Date().addingTimeInterval(3)
+            let deadline = TestTiming.deadline(3)
             while await b.currentHolder != "viewer-1", Date() < deadline { try await Task.sleep(nanoseconds: 1_000_000) }
             let offset = got.all.count
             await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
@@ -985,25 +1012,26 @@ final class ScreenBroadcastTests: XCTestCase {
             onRemoteInput: { pointer, _ in
                 if pointer.p == 999 {
                     entered.value = true
-                    _ = release.wait(timeout: .now() + 20)
+                    _ = release.wait(timeout: .now() + TestTiming.farAway)
                     return
                 }
                 got.add(pointer)
             })
         await settle()
         transport.signal(Self.offer("viewer-1"))
-        await settle(250)
+        try await answered(transport, 1)
+        try await waitUntil { !stale.sent.isEmpty }  // 첫 채널이 붙었다
         transport.signal(Self.offer("viewer-1")) // 재협상 — 앞 채널은 낡은 세대다(닫히지 않았다)
-        await settle(250)
+        try await answered(transport, 2)
+        try await waitUntil { !current.sent.isEmpty }  // 새 채널이 붙었다
         current.push(Self.pointerFrame("down", 5))
-        await settle(50)
         current.push(Self.pointerFrame("up", 999))
-        let deadline = Date().addingTimeInterval(3)
+        let deadline = TestTiming.deadline(3)
         while !entered.value, Date() < deadline { try await Task.sleep(nanoseconds: 1_000_000) }
         current.push(Self.pointerFrame("up", 5))                       // 현재 세대의 놓기(대기)
         for _ in 0..<300 { stale.push(Self.pointerFrame("down", 1)) } // 낡은 채널의 홍수
         release.signal()
-        await settle(300)
+        _ = await TestTiming.until { got.all.contains { $0.p == 5 && ($0.t == "up" || $0.t == "cancel") } }
         let seen = got.all.map { "\($0.t)\($0.p)" }
         XCTAssertEqual(seen.first, "down5")
         XCTAssertTrue(seen.contains("up5") || seen.contains("cancel5"), "포인터 5 가 눌린 채 남았다: \(seen)")
@@ -1031,19 +1059,21 @@ final class ScreenBroadcastTests: XCTestCase {
             onRemoteInput: { pointer, _ in
                 if pointer.p == 999 {
                     entered.value = true
-                    _ = release.wait(timeout: .now() + 20)
+                    _ = release.wait(timeout: .now() + TestTiming.farAway)
                     return
                 }
                 got.add(pointer)
             })
         await settle()
         transport.signal(Self.offer("viewer-1"))
-        await settle(250)
+        try await answered(transport, 1)
+        try await waitUntil { !stale.sent.isEmpty }  // 첫 채널이 붙었다
         transport.signal(Self.offer("viewer-1")) // 재협상 — 앞 채널은 낡은 세대다(닫히지 않았다)
-        await settle(250)
+        try await answered(transport, 2)
+        try await waitUntil { !current.sent.isEmpty }  // 새 채널이 붙었다
         try await before(stale, current)
         current.push(Self.pointerFrame("up", 999))
-        let deadline = Date().addingTimeInterval(3)
+        let deadline = TestTiming.deadline(3)
         while !entered.value, Date() < deadline { try await Task.sleep(nanoseconds: 1_000_000) }
         XCTAssertTrue(entered.value, "헬퍼를 붙잡지 못했다")
         return (b, stale, current, release)
@@ -1055,7 +1085,7 @@ final class ScreenBroadcastTests: XCTestCase {
         let got = PointerBox()
         let (b, stale, current, release) = try await twoChannelViewer(recordInto: got) { _, current in
             current.push(Self.pointerFrame("down", 5))
-            let deadline = Date().addingTimeInterval(3)
+            let deadline = TestTiming.deadline(3)
             while got.all.count < 1, Date() < deadline { try await Task.sleep(nanoseconds: 1_000_000) }
         }
         for _ in 0..<300 { stale.push(Self.pointerFrame("down", 1)) } // 낡은 채널의 홍수(현재 채널의 밀린 것은 없다)
@@ -1063,11 +1093,12 @@ final class ScreenBroadcastTests: XCTestCase {
         current.push(Self.pointerFrame("move", 5, 0.7))
         current.push(Self.pointerFrame("up", 5, 0.7))
         release.signal()
-        await settle(300)
+        _ = await TestTiming.until { got.all.count >= 2 }
+        await settle(300)  // 그 뒤의 move · up 이 닿지 않는지 볼 창
         XCTAssertEqual(got.all.map { "\($0.t)\($0.p)" }, ["down5", "cancel5"], "cancel 뒤의 move · up 이 down 없이 닿았다")
         current.push(Self.pointerFrame("down", 5, 0.2)) // 새 제스처는 다시 받는다
         current.push(Self.pointerFrame("move", 5, 0.3))
-        await settle(100)
+        _ = await TestTiming.until { got.all.count >= 4 }
         XCTAssertEqual(got.all.map { "\($0.t)\($0.p)" }, ["down5", "cancel5", "down5", "move5"])
         await b.stop()
     }
@@ -1101,7 +1132,7 @@ final class ScreenBroadcastTests: XCTestCase {
         let transport = FakeTransport()
         let (b, channel, got, release, _) = try await blockedInput(transport) { b, _, _, _ in
             transport.holder("viewer-1")
-            let deadline = Date().addingTimeInterval(3)
+            let deadline = TestTiming.deadline(3)
             while await b.currentHolder != "viewer-1", Date() < deadline { try await Task.sleep(nanoseconds: 1_000_000) }
         }
         transport.holder("viewer-1") // renew
@@ -1133,7 +1164,7 @@ final class ScreenBroadcastTests: XCTestCase {
             onRemoteInput: { pointer, viewer in
                 if pointer.p == 999 {
                     entered.value = true
-                    _ = release.wait(timeout: .now() + 20)
+                    _ = release.wait(timeout: .now() + TestTiming.farAway)
                     return
                 }
                 log.add(pointer, viewer)
@@ -1141,11 +1172,11 @@ final class ScreenBroadcastTests: XCTestCase {
         await settle()
         transport.signal(Self.offer("v1"))
         transport.signal(Self.offer("v2"))
-        await settle(300)
+        try await answered(transport, 2)
+        try await waitUntil { channels.values.allSatisfy { !$0.sent.isEmpty } }  // 두 채널이 붙었다
         channels["v1"]?.push(Self.pointerFrame("down", 3)) // v1 의 열린 포인터
-        await settle(50)
         channels["v2"]?.push(Self.pointerFrame("up", 999))
-        let deadline = Date().addingTimeInterval(3)
+        let deadline = TestTiming.deadline(3)
         while !entered.value, Date() < deadline { try await Task.sleep(nanoseconds: 1_000_000) }
         var expectedV2: [String] = []
         for i in 0..<300 {
@@ -1158,7 +1189,11 @@ final class ScreenBroadcastTests: XCTestCase {
             }
         }
         release.signal()
-        await settle(300)
+        let wanted = expectedV2.count
+        _ = await TestTiming.until {
+            log.all.filter { $0.viewer == "v2" }.count >= wanted && log.all.filter { $0.viewer == "v1" }.count >= 2
+        }
+        await settle(100)
         let v2 = log.all.filter { $0.viewer == "v2" }.map { "\($0.pointer.t)\(Int(($0.pointer.x * 1000).rounded()))" }
         let v1 = log.all.filter { $0.viewer == "v1" }.map(\.pointer.t)
         XCTAssertEqual(v2, expectedV2, "다른 뷰어의 프레임이 버려지거나 순서가 바뀌었다")
@@ -1177,7 +1212,7 @@ final class ScreenBroadcastTests: XCTestCase {
         let second = try await client.submitRegistrationCode("B") // 헬퍼가 붙잡힌 사이 재등록 — r2
         XCTAssertEqual(second.registrationId, "r2")
         release.signal()
-        let deadline = Date().addingTimeInterval(3)
+        let deadline = TestTiming.deadline(3)
         while await !b.holderNoticesSettled, Date() < deadline { try await Task.sleep(nanoseconds: 1_000_000) }
         let holder = await b.currentHolder
         XCTAssertNil(holder, "재등록 전 등록의 통지가 게이트를 열었다")
@@ -1201,7 +1236,7 @@ final class ScreenBroadcastTests: XCTestCase {
             onRemoteInput: { pointer, _ in
                 if pointer.p == 999 {
                     entered.value = true
-                    _ = release.wait(timeout: .now() + 20)
+                    _ = release.wait(timeout: .now() + TestTiming.farAway)
                 } else if pointer.t == "cancel", pointer.p == 7, !pushedMidDrain.value {
                     // 드레인 한가운데(앞 통지를 적용하며 합성된 cancel) — 줄은 255건, 두 건 더 넣어 다시 넘치게 한다.
                     pushedMidDrain.value = true
@@ -1211,19 +1246,20 @@ final class ScreenBroadcastTests: XCTestCase {
             })
         await settle()
         transport.signal(Self.offer("viewer-1"))
-        await settle(250)
+        try await answered(transport, 1)
+        try await waitUntil { !channel.sent.isEmpty }  // 채널이 붙었다(hello 가 나갔다)
         transport.holder("viewer-1")
-        var deadline = Date().addingTimeInterval(3)
+        var deadline = TestTiming.deadline(3)
         while await b.currentHolder != "viewer-1", Date() < deadline { try await Task.sleep(nanoseconds: 1_000_000) }
         channel.push(Self.pointerFrame("down", 7)) // 열린 포인터
         channel.push(Self.pointerFrame("up", 999))
-        deadline = Date().addingTimeInterval(3)
+        deadline = TestTiming.deadline(3)
         while !entered.value, Date() < deadline { try await Task.sleep(nanoseconds: 1_000_000) }
         transport.holder("viewer-1") // 넘쳐 버려진다
         for _ in 0..<256 { transport.holder("y") }
         XCTAssertEqual(b.pendingHolderNoticeCount, 256)
         release.signal()
-        deadline = Date().addingTimeInterval(3)
+        deadline = TestTiming.deadline(3)
         while await !b.holderNoticesSettled || !pushedMidDrain.value, Date() < deadline {
             try await Task.sleep(nanoseconds: 1_000_000)
         }
@@ -1250,9 +1286,10 @@ final class ScreenBroadcastTests: XCTestCase {
             onRemoteInput: { pointer, _ in got.add(pointer) })
         await settle()
         transport.signal(Self.offer("viewer-1"))
-        await settle(250)
+        try await answered(transport, 1)
+        try await waitUntil { !channel.sent.isEmpty }  // 채널이 붙었다(hello 가 나갔다)
         transport.holder("viewer-1")
-        var deadline = Date().addingTimeInterval(3)
+        var deadline = TestTiming.deadline(3)
         while await b.currentHolder != "viewer-1", Date() < deadline { try await Task.sleep(nanoseconds: 1_000_000) }
 
         // 클라이언트 액터를 채널 콜백으로 붙잡는다.
@@ -1260,14 +1297,14 @@ final class ScreenBroadcastTests: XCTestCase {
         let release = DispatchSemaphore(value: 0)
         await client.on("gate") { _ in
             entered.value = true
-            _ = release.wait(timeout: .now() + 20)
+            _ = release.wait(timeout: .now() + TestTiming.farAway)
         }
         transport.message("gate")
-        deadline = Date().addingTimeInterval(5)
+        deadline = TestTiming.deadline(5)
         while !entered.value, Date() < deadline { try await Task.sleep(nanoseconds: 1_000_000) }
         // ⚠️ 여기부터 release 전까지 client 를 await 하지 않는다.
         transport.holder(nil)
-        deadline = Date().addingTimeInterval(2)
+        deadline = TestTiming.deadline(2)
         while await b.currentHolder != nil, Date() < deadline { try await Task.sleep(nanoseconds: 1_000_000) }
         let holder = await b.currentHolder
         XCTAssertNil(holder, "클라이언트가 바쁜 동안 회수가 적용되지 않았다")
@@ -1298,7 +1335,7 @@ final class ScreenBroadcastTests: XCTestCase {
                 channel.push(Self.pointerFrame("move", 0, Double(i) / Double(total)))
             }
         }
-        let deadline = Date().addingTimeInterval(30)
+        let deadline = TestTiming.deadline(30)
         while got.all.count < total, Date() < deadline { try await Task.sleep(nanoseconds: 10_000_000) }
         let xs = got.all.map(\.x)
         XCTAssertEqual(xs.count, total)
@@ -1319,7 +1356,7 @@ final class ScreenBroadcastTests: XCTestCase {
                 channel.push(Self.pointerFrame("down", p))
                 channel.push(Self.pointerFrame("up", p))
             }
-            let deadline = Date().addingTimeInterval(3)
+            let deadline = TestTiming.deadline(3)
             while got.all.count < 2 * (round + 1), Date() < deadline { try await Task.sleep(nanoseconds: 500_000) }
             if got.all.suffix(2).map(\.t) != ["down", "up"] { reversed += 1 }
         }
@@ -1356,10 +1393,11 @@ final class ScreenBroadcastTests: XCTestCase {
         broadcast.value = b
         await settle()
         transport.signal(Self.offer("viewer-1"))
-        await settle(250)
+        try await answered(transport, 1)
+        try await waitUntil { !channel.sent.isEmpty }  // 채널이 붙었다(hello 가 나갔다)
         // 드레인 태스크와 위 읽기가 같은 우선순위로 줄을 서게 한다(액터는 우선순위가 높은 일을 먼저 돌린다).
         await Task.detached(priority: .medium) { channel.push(#"{"t":"move","p":0,"x":0.5,"y":0.5}"#) }.value
-        let deadline = Date().addingTimeInterval(60)
+        let deadline = TestTiming.deadline(60)
         while delivered.peek < total || deliveredAtRead.value == nil, Date() < deadline {
             try await Task.sleep(nanoseconds: 10_000_000)
         }
@@ -1389,17 +1427,18 @@ final class ScreenBroadcastTests: XCTestCase {
             onRemoteInput: { pointer, _ in
                 if pointer.p == 999 {
                     entered.value = true
-                    _ = release.wait(timeout: .now() + 20)
+                    _ = release.wait(timeout: .now() + TestTiming.farAway)
                     return
                 }
                 got.add(pointer)
             })
         await settle()
         transport.signal(Self.offer("viewer-1"))
-        await settle(250)
+        try await answered(transport, 1)
+        try await waitUntil { !channel.sent.isEmpty }  // 채널이 붙었다(hello 가 나갔다)
         try await before(b, channel, got, client)
         channel.push(Self.pointerFrame("up", 999))
-        let deadline = Date().addingTimeInterval(5)
+        let deadline = TestTiming.deadline(5)
         while !entered.value, Date() < deadline { try await Task.sleep(nanoseconds: 1_000_000) }
         XCTAssertTrue(entered.value, "헬퍼를 붙잡지 못했다")
         return (b, channel, got, release, client)
@@ -1425,7 +1464,7 @@ final class ScreenBroadcastTests: XCTestCase {
         // 지키는 프레임 250 + 남은 move 750(가장 새 것) — 받은 순서 그대로.
         let firstKeptMove = 1500 - 750
         let expected = plan.filter { $0.t != "move" || Int(($0.x * 1500).rounded()) >= firstKeptMove }
-        let deadline = Date().addingTimeInterval(10)
+        let deadline = TestTiming.deadline(10)
         while got.all.count < expected.count, Date() < deadline { try await Task.sleep(nanoseconds: 2_000_000) }
         let delivered = got.all
         XCTAssertEqual(delivered.count, expected.count)
@@ -1462,7 +1501,7 @@ final class ScreenBroadcastTests: XCTestCase {
         XCTAssertEqual(PointerFrameInbox.keptLimitPerViewer, 256)
         let (b, channel, got, release, client) = try await blockedInput { _, channel, got, _ in
             channel.push(Self.pointerFrame("down", 7)) // 앱에 닿아 열린 포인터
-            let deadline = Date().addingTimeInterval(3)
+            let deadline = TestTiming.deadline(3)
             while got.all.count < 1, Date() < deadline { try await Task.sleep(nanoseconds: 1_000_000) }
         }
         // ⚠️ 여기부터 release 전까지 b 를 await 하지 않는다 — 액터가 붙잡혀 있다.
@@ -1477,7 +1516,7 @@ final class ScreenBroadcastTests: XCTestCase {
         XCTAssertEqual(b.pendingPointerFrameCount, PointerFrameInbox.limit)
         release.signal()
         let expected = 1 + 1 + 86 + (PointerFrameInbox.limit - 87)
-        let deadline = Date().addingTimeInterval(5)
+        let deadline = TestTiming.deadline(5)
         while got.all.count < expected, Date() < deadline { try await Task.sleep(nanoseconds: 2_000_000) }
         let delivered = Array(got.all.dropFirst()) // 첫 down(p=7)
         XCTAssertEqual(delivered.first, RemoteInputPointer(t: "cancel", p: 7, x: 0.5, y: 0.5), "열린 포인터를 닫지 않았다")
@@ -1555,14 +1594,10 @@ final class ScreenBroadcastTests: XCTestCase {
         return frame
     }
 
-    /// 조건이 설 때까지 기다린다(상한 3초) — 섰으면 true.
+    /// 조건이 설 때까지 기다린다(TestTiming.hangGuard 까지 — 종전의 3초는 멈춘 러너에서 모자랐다) — 섰으면 true.
+    /// "서지 않는다"를 보는 자리에는 쓰지 않는다(그런 자리는 settle 뒤에 값을 본다).
     private func until(_ condition: () async -> Bool) async -> Bool {
-        let deadline = Date().addingTimeInterval(3)
-        while Date() < deadline {
-            if await condition() { return true }
-            try? await Task.sleep(nanoseconds: 10_000_000)
-        }
-        return await condition()
+        await TestTiming.until(0, pollNanos: 10_000_000, condition)
     }
 
     /// 같은 참여자의 두 탭(수신기 r1 · r2) — 세션이 따로고, 뒤의 offer 가 앞의 화면을 끊지 않는다. answer · ICE 는 두 id 를
@@ -1582,6 +1617,7 @@ final class ScreenBroadcastTests: XCTestCase {
         guard await until({ transport.answers.count == 1 }) else { return XCTFail("r1 not answered") }
         transport.signal(offerFrom("v1", "r2", "n-b"))
         guard await until({ transport.answers.count == 2 }) else { return XCTFail("r2 not answered") }
+        guard await until({ transport.kinds.filter { $0 == "ice" }.count == 2 }) else { return XCTFail("ice not relayed") }
         await settle()
 
         let count = await b.viewerCount
@@ -1706,6 +1742,7 @@ final class ScreenBroadcastTests: XCTestCase {
 
         transport.signal(offerFrom("v1", "r5"))
         guard await until({ transport.answers.count == 7 }) else { return XCTFail("r5 not answered") }
+        guard await until({ log.sessions(of: "v1")[0].closed }) else { return XCTFail("r1 not evicted") }  // 닫기는 따로 도는 태스크다
         await settle()
         let still = await b.viewerCount
         XCTAssertEqual(still, 5)
@@ -1728,7 +1765,7 @@ final class ScreenBroadcastTests: XCTestCase {
         func close() async { lock.withLock { closedStorage = true } }
     }
 
-    /// AGENTS.md 8 — 상한의 희생자는 살아 있다고 알 수 없는 세션(answer 를 아직 보내지 않은 협상)이 먼저, 그다음 가장 작은 세대.
+    /// 수신기 상한의 희생자는 살아 있다고 알 수 없는 세션(answer 를 아직 보내지 않은 협상)이 먼저, 그다음 가장 작은 세대.
     /// 세대만 보던 종전에는 가장 오래된(answer 를 보낸) r1 을 밀어냈다.
     func testAFifthReceiverEvictsAnUnansweredNegotiationBeforeTheOldestLiveSession() async throws {
         let transport = FakeTransport()
@@ -1914,7 +1951,7 @@ final class ScreenBroadcastTests: XCTestCase {
         await b.stop()
     }
 
-    // ── 이른 뷰어 ICE(AGENTS.md 10) — 세션 · offer 적용 전에 온 후보를 버리지 않는다 ─────────────
+    // ── 이른 뷰어 ICE — 세션 · offer 적용 전에 온 후보를 버리지 않는다 ─────────────
 
     private func iceWith(_ viewer: String, _ receiverId: String, _ candidate: String, _ negotiationId: String?) -> [String: Any] {
         var frame: [String: Any] = [
@@ -2039,9 +2076,10 @@ final class ScreenBroadcastTests: XCTestCase {
         let started = Date()
         transport.signal(offerFrom("v2", "r1"))
         guard await until({ transport.answers.count == 2 }) else { return XCTFail("second not answered") }
+        // 시한(0.2초)까지는 기다렸다 — 하한만 잰다. "시한에 답했다"는 위의 조건 대기가 본다: 시한이 듣지 않으면 조회가
+        // 60초 붙잡혀 그 대기(hangGuard)에 걸린다. 종전의 상한 3초는 느린 러너에서 여유가 2.8초였다.
         let elapsed = Date().timeIntervalSince(started)
         XCTAssertGreaterThanOrEqual(elapsed, 0.15)
-        XCTAssertLessThan(elapsed, 3)
         XCTAssertEqual(seen.all.last?.first?.urls, ["stun:stun.example.org:3478"])
         let notes = client.diagnostics().filter { $0.code == "ice-servers" }.map(\.message)
         XCTAssertEqual(notes, ["ICE server lookup: no answer within 0.2 s — answering with the last known ICE servers (1)"])
@@ -2126,14 +2164,20 @@ final class ScreenBroadcastTests: XCTestCase {
             log.add(viewer, s)
             return s
         })
-        await b.setEarlyIceHoldMs(300)
+        // 쥠의 시한은 멀리 둔다 — 종전(0.3초)에는 76건이 처리되는 사이나 "상한에 찼다"를 보기 전에 러너가 0.3초 멈추면 쥠이
+        // 먼저 걷혀 64 를 보지 못했다. 일화를 끝낼 때만 시한을 줄여, 도착 하나의 쓸기로 쥠을 모두 걷는다.
+        await b.setEarlyIceHoldMs(UInt64(TestTiming.farAway * 1000))
         await settle()
         func notes() -> Int { client.diagnostics().filter { $0.code == "ice-queue" }.count }
         for i in 0..<6 { transport.signal(iceWith("v1", "r\(i)", "a\(i)", "n-1")) }
         for i in 0..<70 { transport.signal(iceWith("w\(i)", "r1", "b\(i)", "n-1")) }
         guard await until({ await b.iceQueueKeyCount == ScreenBroadcast.earlyIceMaxHeldKeys }) else { return XCTFail("not capped") }
         XCTAssertEqual(notes(), 1)
-        guard await until({ await b.iceQueueKeyCount == 0 }) else { return XCTFail("holds did not expire") }
+        await b.setEarlyIceHoldMs(1)
+        await settle(20)  // 쥔 것들이 1 ms 보다 나이를 먹게
+        transport.signal(iceWith("sweeper", "r1", "x", "n-1"))  // 이 도착의 쓸기가 앞의 쥠을 모두 걷는다(일화 끝)
+        guard await until({ await b.iceQueueKeyCount <= 1 }) else { return XCTFail("holds did not expire") }
+        await b.setEarlyIceHoldMs(UInt64(TestTiming.farAway * 1000))
         for i in 0..<5 { transport.signal(iceWith("v1", "s\(i)", "c\(i)", "n-1")) }
         guard await until({ notes() == 2 }) else { return XCTFail("the next episode was not noted: \(notes())") }
         await b.stop()
@@ -2144,7 +2188,9 @@ final class ScreenBroadcastTests: XCTestCase {
         let transport = FakeTransport()
         let log = SessionLog()
         let b = try await loggedBroadcast(transport, log)
-        await b.setEarlyIceHoldMs(150)
+        // 시한 2초 — 종전(0.15초)에는 "쥐었다"를 보기 전에 러너가 0.15초 멈추면 쥠이 먼저 걷혔다. 타이머가 걷는 길을 보려면
+        // 실제 시한을 기다려야 하므로 멀리 밀 수는 없고, 관측 여유만 넓힌다.
+        await b.setEarlyIceHoldMs(2000)
         var running = await b.iceHoldTimerRunning
         XCTAssertFalse(running)
         transport.signal(iceWith("v1", "r1", "stale", "n-1"))
@@ -2153,7 +2199,7 @@ final class ScreenBroadcastTests: XCTestCase {
         XCTAssertTrue(running)
         guard await until({ await b.iceQueueKeyCount == 0 }) else { return XCTFail("hold did not expire") }
         guard await until({ await !b.iceHoldTimerRunning }) else { return XCTFail("timer still running") }
-        // 쥠이 없으면 타이머는 다시 걸리지 않는다 — 시한(150ms)보다 오래 지켜본다.
+        // 쥠이 없으면 타이머는 다시 걸리지 않는다 — 다시 건다면 걷은 그 자리에서 걸었을 것이다. 잠시 지켜본다.
         for _ in 0..<20 {
             let running = await b.iceHoldTimerRunning
             XCTAssertFalse(running)
@@ -2169,13 +2215,16 @@ final class ScreenBroadcastTests: XCTestCase {
     /// (i) 시한은 offer 전 쥠에만 — 지금 시도의 큐(세션 · offer 적용을 기다린다)는 적용 · 대체 · 잊기까지 산다(상한 200).
     func testTheCurrentAttemptsQueueIsNotAged() async throws {
         let transport = FakeTransport()
-        transport.iceDelayMs = 500
+        // 시한 0.5초 · 쉼 0.7초 · ICE 조회 1.5초 — 쉼은 시한보다 길어야 하고(하한), 조회는 쉼보다 길어야 q1 이 올 때 시도가
+        // 아직 세션을 기다린다. 종전(0.1 · 0.25 · 0.5초)에는 아래에서 잇달아 넣는 fresh-next 와 그 offer 사이가 0.1초 벌어지면
+        // (멈춘 러너) fresh-next 가 먼저 걷혔다 — 그 여유를 0.5초로 넓힌다.
+        transport.iceDelayMs = 1500
         let log = SessionLog()
         let b = try await loggedBroadcast(transport, log)
-        await b.setEarlyIceHoldMs(100)
+        await b.setEarlyIceHoldMs(500)
         transport.signal(offerFrom("v1", "r1", "n-1"))
         transport.signal(iceWith("v1", "r1", "q0", "n-1"))
-        await settle(250)
+        await settle(700)
         transport.signal(iceWith("v1", "r1", "q1", "n-1")) // 이 도착의 쓸기가 q0 을 걷으면 안 된다
         guard await until({ transport.answers.count == 1 }) else { return XCTFail("not answered") }
         guard await until({ log.sessions(of: "v1").first?.candidates.count == 2 }) else {
@@ -2186,7 +2235,7 @@ final class ScreenBroadcastTests: XCTestCase {
         // 더 새 협상의 후보는 지금 시도의 것이 아니다 — 그 offer 를 기다리는 쥠이라 같은 시한이 걸린다(TS 와 같다).
         transport.signal(offerFrom("v1", "r1", "n-2"))
         transport.signal(iceWith("v1", "r1", "stale-next", "n-3"))
-        await settle(250)
+        await settle(700)
         transport.signal(iceWith("v1", "r1", "fresh-next", "n-3"))
         transport.signal(offerFrom("v1", "r1", "n-3"))
         guard await until({ transport.answers.count == 2 }) else { return XCTFail("n-3 not answered") }
@@ -2375,7 +2424,9 @@ final class ScreenBroadcastTests: XCTestCase {
         await settle(20)
         transport.signal(iceWith("v1", "r1", "while-away", "n-1"))
         transport.joinedAndConnected(Member(participantId: "me-2", displayName: "unity-screen", providesView: "stream"))
-        await settle(80)
+        // 새 나를 알아보고(옛 쥠을 버리고) ready 를 다시 알릴 때까지 — 그 정리는 따로 도는 태스크라, 고정 대기 뒤에 offer 를
+        // 넣으면 느린 러너에서 offer 가 정리보다 먼저 닿아 옛 후보까지 받는다.
+        try await announced(transport, 2)
         transport.signal(offerFrom("v1", "r1"))
         guard await until({ transport.answers.count == 1 }) else { return XCTFail("not answered") }
         guard await until({ (log.sessions(of: "v1").first?.candidates.count ?? 0) >= 1 }) else { return XCTFail("not applied") }
@@ -2564,7 +2615,9 @@ final class ScreenBroadcastTests: XCTestCase {
         let transport = FakeTransport()
         let client = try await openClient(transport)
         let b = await startScreenBroadcast(client: client, createSession: { _, _, _, _ in nil })
-        await b.setSourceChangedWindowMs(300)
+        // 창 1.5초 — 종전(0.3초)에는 "창 안에서 더 보내지 않았다"를 0.1초 쉬고 봤는데, 그 쉼이 러너 부하로 0.3초를 넘기면
+        // 창 끝의 ready 가 먼저 나가 거짓 실패했다. 창은 실제 타이머라 멀리 밀 수 없고, 여유만 넓힌다(0.2 → 1.4초).
+        await b.setSourceChangedWindowMs(1500)
         await settle()
         XCTAssertEqual(transport.kinds.filter { $0 == "ready" }.count, 1)
 
@@ -2573,7 +2626,7 @@ final class ScreenBroadcastTests: XCTestCase {
         try await Task.sleep(nanoseconds: 100_000_000)
         XCTAssertEqual(transport.kinds.filter { $0 == "ready" }.count, 2, "창 안에서 더 보냈다")
         guard await until({ transport.kinds.filter { $0 == "ready" }.count == 3 }) else { return XCTFail("no trailing ready") }
-        try await Task.sleep(nanoseconds: 450_000_000)
+        try await Task.sleep(nanoseconds: 1_800_000_000)  // 창 하나보다 길게 — 그 뒤에 더 보내지 않는다
         XCTAssertEqual(transport.kinds.filter { $0 == "ready" }.count, 3, "부르지 않았는데 보냈다")
         await b.stop()
     }
@@ -2657,12 +2710,14 @@ final class ScreenBroadcastTests: XCTestCase {
         let log = SessionLog()
         let b = try await loggedBroadcast(transport, log)
         for v in ["v1", "v2", "v3"] { transport.signal(Self.offer(v)) }
-        await settle(250)
+        try await answered(transport, 3)
 
         reconnect(transport)
         await settle(150)
         transport.signal(Self.peers(["host", "v2"]))
-        await settle(200)
+        // 닫기는 따로 도는 태스크다 — 닫힐 때까지 기다린 뒤, 닫히면 안 되는 쪽은 잠시 더 지켜본다.
+        _ = await until({ log.sessions(of: "v1")[0].closed && log.sessions(of: "v3")[0].closed })
+        await settle(100)
         XCTAssertTrue(log.sessions(of: "v1")[0].closed)
         XCTAssertTrue(log.sessions(of: "v3")[0].closed)
         XCTAssertFalse(log.sessions(of: "v2")[0].closed, "답에 있는 뷰어를 닫았다")
@@ -2682,12 +2737,12 @@ final class ScreenBroadcastTests: XCTestCase {
         let log = SessionLog()
         let b = try await loggedBroadcast(transport, log)
         for v in ["v1", "v2"] { transport.signal(Self.offer(v)) }
-        await settle(250)
+        try await answered(transport, 2)
 
         reconnect(transport)
         await settle(150)
         transport.signal(Self.peers([]))
-        await settle(200)
+        _ = await until({ log.all.allSatisfy { $0.session.closed } })
         XCTAssertTrue(log.all.allSatisfy { $0.session.closed })
         let count = await b.viewerCount
         XCTAssertEqual(count, 0)
@@ -2700,7 +2755,7 @@ final class ScreenBroadcastTests: XCTestCase {
         let log = SessionLog()
         let b = try await loggedBroadcast(transport, log)
         transport.signal(Self.offer("v1"))
-        await settle(250)
+        try await answered(transport, 1)
 
         reconnect(transport)
         await settle(250) // 답 없음
@@ -2719,7 +2774,7 @@ final class ScreenBroadcastTests: XCTestCase {
         let log = SessionLog()
         let b = try await loggedBroadcast(transport, log)
         transport.signal(Self.offer("v1"))
-        await settle(250)
+        try await answered(transport, 1)
 
         transport.signal(Self.peers([]))
         await settle(200)
@@ -2736,13 +2791,13 @@ final class ScreenBroadcastTests: XCTestCase {
         let log = SessionLog()
         let b = try await loggedBroadcast(transport, log)
         transport.signal(Self.offer("v1"))
-        await settle(250)
+        try await answered(transport, 1)
 
         reconnect(transport)
         await settle(150)
         transport.signal(Self.offer("v1")) // 재협상
         transport.signal(Self.offer("v2")) // 새 뷰어
-        await settle(250)
+        try await answered(transport, 3)
         transport.signal(Self.peers([]))
         await settle(200)
         XCTAssertTrue(log.sessions(of: "v1")[0].closed, "옛 v1 세션은 재협상이 닫는다")
@@ -2763,7 +2818,7 @@ final class ScreenBroadcastTests: XCTestCase {
         let log = SessionLog()
         let b = try await loggedBroadcast(transport, log)
         transport.signal(Self.offer("v1"))
-        await settle(250)
+        try await answered(transport, 1)
 
         reconnect(transport)
         await settle(150)
@@ -2772,11 +2827,12 @@ final class ScreenBroadcastTests: XCTestCase {
         XCTAssertFalse(log.sessions(of: "v1")[0].closed)
 
         transport.signal(Self.offer("v2"))
-        await settle(250)
+        try await answered(transport, 2)
         reconnect(transport)
         await settle(150)
         transport.signal(Self.peers(["v1"]))
-        await settle(200)
+        _ = await until({ log.sessions(of: "v2")[0].closed })
+        await settle(100)
         XCTAssertTrue(log.sessions(of: "v2")[0].closed, "두 번째 끊김의 스냅샷이 v2 를 담지 않았다")
         XCTAssertFalse(log.sessions(of: "v1")[0].closed)
         let count = await b.viewerCount
@@ -2790,16 +2846,17 @@ final class ScreenBroadcastTests: XCTestCase {
         let log = SessionLog()
         let b = try await loggedBroadcast(transport, log)
         transport.signal(Self.offer("v1"))
-        await settle(250)
+        try await answered(transport, 1)
 
         reconnect(transport) // 답이 오지 않는다
         await settle(250)
         transport.signal(Self.offer("v3"))
-        await settle(250)
+        try await answered(transport, 2)
         reconnect(transport)
         await settle(150)
         transport.signal(Self.peers(["v1"]))
-        await settle(200)
+        _ = await until({ log.sessions(of: "v3")[0].closed })
+        await settle(100)
         XCTAssertTrue(log.sessions(of: "v3")[0].closed, "답을 잃은 뒤 온 뷰어가 대조되지 않았다")
         XCTAssertFalse(log.sessions(of: "v1")[0].closed)
         let count = await b.viewerCount
@@ -2815,7 +2872,9 @@ final class ScreenBroadcastTests: XCTestCase {
         let got = PointerBox()
         let (b, channel) = try await wiredInput(transport, got)
         transport.signal(["kind": "peer-left", "participantId": "viewer-1"])
-        await settle(150)
+        // 떠남이 처리된 뒤에 프레임을 넣는다 — 시그널링과 포인터 프레임은 다른 줄이라, 고정 대기 뒤에 넣으면 느린 러너에서
+        // 프레임이 떠남보다 먼저 처리돼 정당하게 배달된다.
+        try await waitUntil { await b.viewerCount == 0 }
         channel.push(#"{"t":"down","p":0,"x":0.5,"y":0.5}"#)
         await settle(150)
         XCTAssertTrue(got.all.isEmpty, "떠난 뷰어의 채널이 입력을 배달했다")
@@ -2837,15 +2896,16 @@ final class ScreenBroadcastTests: XCTestCase {
             onRemoteInput: { p, _ in got.add(p) })
         await settle()
         transport.signal(Self.offer("v"))
-        await settle(250)
+        try await answered(transport, 1)
         transport.signal(Self.offer("v")) // 첫 세션을 대체한다
-        await settle(250)
+        try await answered(transport, 2)
         XCTAssertEqual(wiring.count, 2)
 
         let stale = FakeInputChannel(label: Protocol.RemoteInput.channel)
         wiring.wireInput(0)?(stale)
         wiring.sendIce(0)?(["candidate": "stale"])
         wiring.sendIce(1)?(["candidate": "live"])
+        try await waitUntil { transport.kinds.contains("ice") }  // 살아 있는 세션의 후보가 중계됐다
         await settle(150)
         stale.push(#"{"t":"down","p":0,"x":0.5,"y":0.5}"#)
         await settle(150)
@@ -2879,16 +2939,17 @@ final class ScreenBroadcastTests: XCTestCase {
         await settle(80)
         transport.signal(Self.offer("v1"))
         transport.signal(Self.offer("v2"))
-        await settle(250)
+        try await answered(transport, 2)
+        try await waitUntil { ["v1", "v2"].allSatisfy { !(channels.get($0)?.sent.isEmpty ?? true) } }  // 두 채널이 붙었다
         for v in ["v1", "v2"] { channels.get(v)?.push(#"{"t":"down","p":0,"x":0.5,"y":0.5}"#) }
-        await settle(150)
+        try await waitUntil { await b.droppedNotedCount == 2 }
         var hello = await b.helloTaskCount
         var dropped = await b.droppedNotedCount
         XCTAssertEqual(hello, 2)
         XCTAssertEqual(dropped, 2)
 
         transport.signal(["kind": "peer-left", "participantId": "v1"])
-        await settle(150)
+        try await waitUntil { await b.viewerCount == 1 }
         hello = await b.helloTaskCount
         dropped = await b.droppedNotedCount
         XCTAssertEqual(hello, 1, "peer-left 가 그 뷰어의 hello 재알림을 멈추지 않았다")
@@ -2899,7 +2960,7 @@ final class ScreenBroadcastTests: XCTestCase {
 
         // 채널이 닫혀 송신이 실패하면 루프가 끝나고 — 그 항목도 지워진다(세션은 아직 있다).
         channels.get("v2")?.failSend = true
-        await settle(200)
+        _ = await TestTiming.until { await b.helloTaskCount == 0 }
         hello = await b.helloTaskCount
         XCTAssertEqual(hello, 0, "끝난 재알림 루프의 항목이 남았다")
         let count = await b.viewerCount
@@ -2914,9 +2975,13 @@ final class ScreenBroadcastTests: XCTestCase {
         let client = try await openClient(transport)
         let log = SessionLog()
         let entered = CallCounter()
+        // 세션 만들기를 문으로 붙잡는다 — 첫 시도(와 "gone" 의 시도)는 시험이 문을 열 때까지 만드는 중이다. 종전에는 만드는 데
+        // 100 ms 가 들게 하고 그 사이에 둘째 offer 를 넣었는데, 러너가 100 ms 멈추면 첫 시도가 먼저 끝나 answer 가 둘이 됐다.
+        let firstGate = AsyncGate()
+        let goneGate = AsyncGate()
         let b = await startScreenBroadcast(client: client, createSession: { viewer, _, _, _ in
-            _ = entered.next()
-            try? await Task.sleep(nanoseconds: 100_000_000) // 실제 피어 생성처럼 시간이 든다
+            let n = entered.next()
+            if viewer == "gone" { await goneGate.wait() } else if n == 0 { await firstGate.wait() }
             let s = FakeSession()
             log.add(viewer, s)
             return s
@@ -2924,10 +2989,13 @@ final class ScreenBroadcastTests: XCTestCase {
         await settle()
         transport.signal(Self.offer("v"))
         // 첫 시도가 세션을 만드는 **도중**에 둘째 offer 가 온다(재진입 창).
-        let deadline = Date().addingTimeInterval(3)
-        while entered.peek == 0, Date() < deadline { await settle(5) }
+        try await waitUntil { entered.peek == 1 }
         transport.signal(Self.offer("v"))
-        await settle(500)
+        try await waitUntil { entered.peek == 2 }  // 둘째 시도도 만들기에 들어섰다 — 둘째 offer 가 처리됐다
+        firstGate.open()
+        try await waitUntil { log.sessions(of: "v").count == 2 && log.sessions(of: "v").filter { !$0.closed }.count == 1 }
+        try await answered(transport, 1)
+        await settle(200)  // 낡은 시도가 뒤늦게 answer 를 보내지 않는지 볼 창
         XCTAssertEqual(log.sessions(of: "v").count, 2)
         XCTAssertEqual(log.sessions(of: "v").filter { !$0.closed }.count, 1, "겹친 offer 가 세션을 새게 했다")
         XCTAssertEqual(transport.answers.count, 1, "낡은 시도도 answer 를 보냈다")
@@ -2936,9 +3004,11 @@ final class ScreenBroadcastTests: XCTestCase {
 
         // 만드는 도중 떠난 뷰어 — 끝나는 즉시 스스로 닫는다.
         transport.signal(Self.offer("gone"))
-        await settle(10)
+        try await waitUntil { entered.peek == 3 }  // 만드는 중
         transport.signal(["kind": "peer-left", "participantId": "gone"])
-        await settle(300)
+        try await waitUntil { await b.generationCount == 1 }  // 떠남이 처리됐다(그 세대 항목이 치워졌다)
+        goneGate.open()
+        try await waitUntil { log.sessions(of: "gone").count == 1 && log.sessions(of: "gone").allSatisfy(\.closed) }
         XCTAssertTrue(log.sessions(of: "gone").allSatisfy(\.closed))
         count = await b.viewerCount
         XCTAssertEqual(count, 1)
@@ -2984,9 +3054,13 @@ final class ScreenBroadcastTests: XCTestCase {
     // ── 시그널링 디스패치 순서 — 장부는 도착 순서대로, 협상 본문만 따로(TS `onFrame` 과 같다) ──────────────
 
     /// 세션 생성에 시간이 드는(실제 피어처럼) 송출 — 뒤 프레임이 디스패치되는 동안 앞 협상이 아직 진행 중이다.
-    private func slowSessionBroadcast(_ transport: FakeTransport, _ log: SessionLog) async throws -> ScreenBroadcast {
+    private func slowSessionBroadcast(
+        _ transport: FakeTransport, _ log: SessionLog, _ making: InFlight = InFlight()
+    ) async throws -> ScreenBroadcast {
         let client = try await openClient(transport)
         let b = await startScreenBroadcast(client: client, createSession: { viewer, _, _, _ in
+            making.enter()
+            defer { making.exit() }
             try? await Task.sleep(nanoseconds: 20_000_000)
             let s = FakeSession()
             log.add(viewer, s)
@@ -2994,6 +3068,15 @@ final class ScreenBroadcastTests: XCTestCase {
         })
         await settle()
         return b
+    }
+
+    /// 만드는 중인 세션의 수 — 낡은 시도는 만들기를 마친 뒤에야 제 세션을 닫는다. "다 닫혔다"를 보기 전에 0 을 기다린다.
+    private final class InFlight: @unchecked Sendable {
+        private let lock = NSLock()
+        private var count = 0
+        func enter() { lock.withLock { count += 1 } }
+        func exit() { lock.withLock { count -= 1 } }
+        var idle: Bool { lock.withLock { count == 0 } }
     }
 
     private func answeredSdps(_ transport: FakeTransport, _ viewer: String) -> [String] {
@@ -3007,7 +3090,8 @@ final class ScreenBroadcastTests: XCTestCase {
     func testTheLaterOfTwoQuickOffersFromOneViewerWins() async throws {
         let transport = FakeTransport()
         let log = SessionLog()
-        let b = try await slowSessionBroadcast(transport, log)
+        let making = InFlight()
+        let b = try await slowSessionBroadcast(transport, log, making)
         let viewers = (0..<500).map { "v\($0)" }
         let socketQueue = DispatchQueue(label: "fake-socket-queue")
         socketQueue.async {
@@ -3016,8 +3100,10 @@ final class ScreenBroadcastTests: XCTestCase {
                 transport.signal(Self.offer(v, sdp: "new-\(v)"))
             }
         }
-        let deadline = Date().addingTimeInterval(10)
+        let deadline = TestTiming.deadline(10)
         while transport.answers.count < viewers.count, Date() < deadline { await settle(10) }
+        // 낡은 시도가 만들던 세션까지 다 만들어져(그리고 스스로 닫혀) 열린 세션이 뷰어마다 하나가 될 때까지.
+        _ = await until({ making.idle && log.open.count == viewers.count })
         await settle(150) // 늦게 오는 낡은 answer 까지 기다린다
         var staleAnswer: [String] = []
         var staleSession: [String] = []
@@ -3037,7 +3123,8 @@ final class ScreenBroadcastTests: XCTestCase {
     func testAnOfferFollowedByPeerLeftLeavesNothingBehind() async throws {
         let transport = FakeTransport()
         let log = SessionLog()
-        let b = try await slowSessionBroadcast(transport, log)
+        let making = InFlight()
+        let b = try await slowSessionBroadcast(transport, log, making)
         let viewers = (0..<200).map { "gone\($0)" }
         let socketQueue = DispatchQueue(label: "fake-socket-queue")
         socketQueue.async {
@@ -3045,14 +3132,21 @@ final class ScreenBroadcastTests: XCTestCase {
                 transport.signal(Self.offer(v))
                 transport.signal(["kind": "peer-left", "participantId": v])
             }
+            // 표지 — 이 뷰어의 answer 가 나갔으면 앞의 400 프레임은 모두 처리됐다(프레임은 도착 순서대로 처리된다). 고정
+            // 400 ms 뒤에 "다 처리됐을 것"이라 보면 느린 러너에서 만드는 중인 세션이 아직 열려 있다.
+            transport.signal(Self.offer("marker"))
         }
-        await settle(400)
+        try await answered(transport, 1)
+        _ = await until({ making.idle && log.all.filter { $0.viewer != "marker" }.allSatisfy { $0.session.closed } })
+        await settle(150)  // 떠난 뷰어에게 뒤늦게 answer 를 보내지 않는지 볼 창
         let count = await b.viewerCount
         let generations = await b.generationCount
-        XCTAssertEqual(count, 0, "떠난 뷰어의 세션이 남았다")
-        XCTAssertEqual(generations, 0, "떠난 뷰어의 세대 항목이 남았다")
-        XCTAssertTrue(log.all.allSatisfy { $0.session.closed }, "만든 세션이 닫히지 않았다")
-        XCTAssertEqual(transport.answers.count, 0, "떠난 뷰어에게 answer 를 보냈다")
+        XCTAssertEqual(count, 1, "떠난 뷰어의 세션이 남았다")  // 표지 뷰어만
+        XCTAssertEqual(generations, 1, "떠난 뷰어의 세대 항목이 남았다")
+        XCTAssertTrue(
+            log.all.filter { $0.viewer != "marker" }.allSatisfy { $0.session.closed }, "만든 세션이 닫히지 않았다")
+        XCTAssertEqual(
+            transport.answers.compactMap { $0["targetParticipantId"] as? String }, ["marker"], "떠난 뷰어에게 answer 를 보냈다")
         await b.stop()
     }
 
@@ -3064,7 +3158,7 @@ final class ScreenBroadcastTests: XCTestCase {
         let b = try await slowSessionBroadcast(transport, log)
         let viewers = (0..<200).map { "pin\($0)" }
         for v in viewers { transport.signal(Self.offer(v, sdp: "first-\(v)")) }
-        let deadline = Date().addingTimeInterval(10)
+        let deadline = TestTiming.deadline(10)
         while transport.answers.count < viewers.count, Date() < deadline { await settle(10) }
         let socketQueue = DispatchQueue(label: "fake-socket-queue")
         socketQueue.async {
@@ -3073,8 +3167,10 @@ final class ScreenBroadcastTests: XCTestCase {
                 transport.signal(Self.offer(v, sdp: "back-\(v)"))
             }
         }
-        let backBy = Date().addingTimeInterval(10)
+        let backBy = TestTiming.deadline(10)
         while transport.answers.count < 2 * viewers.count, Date() < backBy { await settle(10) }
+        // 떠난 세션의 닫기는 따로 도는 태스크다 — 열린 세션이 뷰어마다 하나로 줄 때까지 기다린다.
+        _ = await until({ log.open.count == viewers.count })
         await settle(150)
         var lost: [String] = []
         for v in viewers {
@@ -3094,7 +3190,7 @@ final class ScreenBroadcastTests: XCTestCase {
         let log = SessionLog()
         let b = try await loggedBroadcast(transport, log)
         transport.signal(Self.offer("v1"))
-        await settle(200)
+        try await answered(transport, 1)
         let socketQueue = DispatchQueue(label: "fake-socket-queue")
         socketQueue.async {
             transport.setState(.reconnecting)
@@ -3104,6 +3200,7 @@ final class ScreenBroadcastTests: XCTestCase {
             transport.setState(.reconnecting)    // 두 번째 끊김 — 스냅샷 {v1, v2}
             transport.setState(.connected)
         }
+        try await answered(transport, 2)  // v2 가 답을 받았다 — 그 뒤 닫히지 않는지 지켜본다
         await settle(400)
         XCTAssertEqual(log.sessions(of: "v2").count, 1)
         XCTAssertFalse(log.sessions(of: "v2").first?.closed ?? true, "앞 접속의 peers 답이 새 뷰어를 닫았다")
@@ -3122,14 +3219,14 @@ final class ScreenBroadcastTests: XCTestCase {
         for round in 0..<300 {
             let viewer = "v\(round)"
             transport.signal(Self.offer(viewer))
-            var deadline = Date().addingTimeInterval(2)
+            var deadline = TestTiming.deadline(2)
             while log.sessions(of: viewer).isEmpty, Date() < deadline { try await Task.sleep(nanoseconds: 200_000) }
             let readyBefore = transport.kinds.filter { $0 == "ready" }.count
             socketQueue.async {
                 transport.setState(.reconnecting)
                 transport.setState(.connected)
             }
-            deadline = Date().addingTimeInterval(2)
+            deadline = TestTiming.deadline(2)
             while transport.kinds.filter({ $0 == "ready" }).count <= readyBefore, Date() < deadline {
                 try await Task.sleep(nanoseconds: 200_000)
             }
@@ -3137,7 +3234,7 @@ final class ScreenBroadcastTests: XCTestCase {
                 return XCTFail("round \(round): 재접속 뒤 ready 를 보내지 않았다")
             }
             transport.signal(Self.peers([])) // 모두 떠났다
-            deadline = Date().addingTimeInterval(1)
+            deadline = TestTiming.deadline(1)
             while log.sessions(of: viewer).first?.closed != true, Date() < deadline {
                 try await Task.sleep(nanoseconds: 200_000)
             }
@@ -3154,7 +3251,7 @@ final class ScreenBroadcastTests: XCTestCase {
         let log = SessionLog()
         let b = try await slowSessionBroadcast(transport, log)
         for v in ["v1", "v2"] { transport.signal(Self.offer(v, sdp: "first-\(v)")) }
-        await settle(250)
+        try await answered(transport, 2)
         reconnect(transport)
         await settle(150)
         let socketQueue = DispatchQueue(label: "fake-socket-queue")
@@ -3162,7 +3259,9 @@ final class ScreenBroadcastTests: XCTestCase {
             transport.signal(Self.offer("v1", sdp: "again-v1"))
             transport.signal(Self.peers(["host"])) // v1 · v2 둘 다 없다
         }
-        await settle(300)
+        try await answered(transport, 3)  // 재협상이 답했다
+        _ = await until({ log.sessions(of: "v2").allSatisfy(\.closed) })  // 답에서 빠진 뷰어의 닫기(따로 도는 태스크)
+        await settle(150)  // 그 답이 재협상의 세션까지 닫지 않는지 볼 창
         let v1 = log.sessions(of: "v1")
         XCTAssertEqual(v1.count, 2)
         XCTAssertTrue(v1[0].closed, "재협상이 옛 세션을 닫지 않았다")
@@ -3190,12 +3289,13 @@ final class ScreenBroadcastTests: XCTestCase {
         await b.setHelloReannounceMs(30)
         await settle()
         transport.signal(Self.offer("v1"))
-        await settle(250)
+        try await answered(transport, 1)
+        try await waitUntil { !channel.sent.isEmpty }  // 채널이 붙었다(hello 가 나갔다)
         var hello = await b.helloTaskCount
         XCTAssertEqual(hello, 1)
 
         await client.close()
-        await settle(250)
+        _ = await TestTiming.until { session.closed }
         XCTAssertTrue(session.closed, "클라이언트가 끝났는데 뷰어 세션이 열려 있다")
         hello = await b.helloTaskCount
         XCTAssertEqual(hello, 0)

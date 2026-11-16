@@ -171,7 +171,7 @@ public actor ConnectClient {
     /// A number that goes up on every connect — raised when the window opens. A late answer from a judgment started
     /// before a disconnect (another connection's roster) is neither applied nor allowed to close the window.
     private var connectEpoch = 0
-    // Connect 는 `stage:message` 를 소켓마다 `createRateLimiter(60)`(Connect Omni 서버의 스테이지 소켓 핸들러)으로 막는다.
+    // Connect 는 `stage:message` 를 소켓마다 초당 60개로(Connect Omni 서버의 스테이지 소켓 핸들러) 막는다.
     // 큐를 한꺼번에 내보내던 판은 그래서 밀린 값 가운데 가장 새 것들을 잃었다(150건 → 서버 60건, 마지막 값 150 은 끝내
     // 닿지 않음). 여섯 언어 동률.
     /// The server's publish limit — the server limits `stage:message` per socket (60 per second, burst 60, refilled
@@ -226,6 +226,9 @@ public actor ConnectClient {
     var backoffForTest: TimeInterval { lastBackoff }
     /// Test only — whether a backoff timer is armed.
     var backoffPendingForTest: Bool { backoffTask != nil || paused }
+    /// Test only — whether the judgment window is open or a roster judgment is still running (tests wait for it to
+    /// clear instead of sleeping a fixed time after a connect).
+    var judgmentPendingForTest: Bool { judgmentPending || judgingInFlight }
     // (D1) 순서 큐에 넣던 종전에는 창 안에서 한 번 보낸 대기 인스턴스가 큐 모드에 갇혀 넘침이 진단 링을 덮었고 승격
     // 때 낡은 값이 쏟아졌다(TS · Python · Dart 와 같은 결정).
     /// Sends made inside the judgment window — collected apart from the ordered queue and settled when the judgment
@@ -625,6 +628,8 @@ public actor ConnectClient {
     private var signalingListeners: [Int: @Sendable ([String: Any]) -> Void] = [:]
     private var nextSignalingToken = 0
 
+    /// Experimental: this API may change in a minor release before 1.0.
+    ///
     /// Subscribes to inbound signaling. Cancel with the returned handle's ``SignalingSubscription/cancel()``.
     public func onSignaling(
         _ listener: @escaping @Sendable ([String: Any]) -> Void
@@ -642,6 +647,8 @@ public actor ConnectClient {
         }
     }
 
+    /// Experimental: this API may change in a minor release before 1.0.
+    ///
     /// Outbound signaling — best-effort (dropped before connecting · after the session ended).
     public func sendSignaling(_ payload: [String: Any]) async {
         // 끝난 뒤에는 트랜스포트에 넘기지도 않는다(TS 와 같다) — close() 는 먼저 끝내고 퇴장 확인을 기다리는 동안(최대 1초) 소켓을
@@ -692,6 +699,8 @@ public actor ConnectClient {
     private let eventInbox = TransportEventInbox()
 
     // (§6-5, N4)
+    /// Experimental: this API may change in a minor release before 1.0.
+    ///
     /// Subscribes to remote-input holder notices (`{registrationId, holderParticipantId, ttlMs}`). The adapter accepts
     /// input only from the holder named by these notices — the channel wiring and the holder gate are done by the
     /// ``startScreenBroadcast(client:stream:createSession:)`` helper.
@@ -863,29 +872,20 @@ public actor ConnectClient {
 
     // ── Adapter Stream 레이어 ───────────────────────────────────────────────
 
-    // roster 로 같은 이름의 활성 참여자를 찾던 판정은 크래시 재시작 뒤 유예 중인 같은 키의 옛 행 · 대기 짝을 충돌로 잘못
-    // 셌다(검수). 오류는 여섯 언어 같은 계약(`SocketTransport.mapEnsureError`)이다.
+    // 오류는 여섯 언어 같은 계약(`SocketTransport.mapEnsureError`)이다.
     /// Ensures the Adapter Stream layer (optional) — the server creates and binds the layer of an adapter that joined
     /// with `providesView = "stream"` on its own at join time, so you do not need to call this. Calling it points at that
     /// layer (creating it if missing · idempotent). The name is not sent in the body; **the server derives it from this
     /// member's displayName** — you cannot create someone else's slot. The layer remains after the adapter disconnects.
     ///
     /// ``EnsuredStreamLayer/renamed``: the server gave a different name than requested (``me``'s displayName — e.g.
-    /// `Bridge (2)`). ``EnsuredStreamLayer/nameConflict`` is its older name (the same value). After the client has
-    /// ended it throws `SessionEnded` without a request; cancellation by the caller is `CancellationError`.
+    /// `Bridge (2)`). After the client has ended it throws `SessionEnded` without a request; cancellation by the caller is `CancellationError`.
     public func ensureStreamLayer() async throws -> EnsuredStreamLayer {
         // 끝났으면 서버에 묻지 않는다 — 닫는 중(퇴장 대기)에도 REST 는 닿는다.
         if endedHandled || stateValue == .ended {
             throw AdapterError("SessionEnded", "this client has ended — cannot ensure a stream layer")
         }
-        let result = try await transport.ensureStreamLayer()
-        return EnsuredStreamLayer(
-            layerId: result.layerId,
-            name: result.name,
-            created: result.created,
-            nameConflict: result.renamed,
-            renamed: result.renamed
-        )
+        return try await transport.ensureStreamLayer()
     }
 
     // ── 송신 ────────────────────────────────────────────────────────────────

@@ -93,7 +93,7 @@ final class ValidateBodyTests: XCTestCase {
             captured.body.keys.sorted(),
             ["token", "displayName", "clientType", "strictRouting", "adapter", "adapterVersion", "runtime", "runtimeVersion"]
                 .sorted())
-        // 어댑터 신원(ADR-0016 · D4) — 옵션이 아니라 언제나 싣는다. 사용자 데이터는 없다.
+        // 어댑터 신원 — 옵션이 아니라 언제나 싣는다. 사용자 데이터는 없다.
         let os = ProcessInfo.processInfo.operatingSystemVersion
         XCTAssertEqual(captured.body["adapter"] as? String, "swift")
         XCTAssertEqual(captured.body["adapterVersion"] as? String, AdapterIdentity.adapterVersion)

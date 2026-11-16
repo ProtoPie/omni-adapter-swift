@@ -95,7 +95,6 @@ public actor ScreenBroadcast {
     /// The generation that created each session (key) — when a session reported through ``sessionClosed(_:)`` is older
     /// than an attempt still in progress, that attempt (generation) is kept. Written and cleared together with ``sessions``.
     private var sessionGenerations: [String: Int] = [:]
-    // 원문 끝의 근거: (AGENTS.md 8)
     /// The generation that sent its answer, per session (key) — when the receiver cap picks a session to evict, sessions
     /// whose current generation has not sent its answer yet (a negotiation not known to be live) go first.
     private var answeredGenerations: [String: Int] = [:]
@@ -215,7 +214,7 @@ public actor ScreenBroadcast {
     /// receiverId's session stays behind, because peer-left comes only from that participant's last socket (team members
     /// get a new participantId per tab, so peer-left does arrive for them).
     static let maxReceiversPerViewer = 4
-    // 원문: (여섯 언어 같은 값, AGENTS.md 10)
+    // 원문: (여섯 언어 같은 값)
     /// How long (ms) viewer ICE that arrived before an offer is held — the server forwards a guest's offer only after its
     /// database checks but forwards ICE immediately, so candidates can arrive before the offer. They are handed to an
     /// offer that arrives in the meantime when its negotiation id matches.
@@ -289,7 +288,7 @@ public actor ScreenBroadcast {
     /// Session key → the generation of the drainer currently handing over candidates (``drainIce(_:_:_:)``, one per key · generation).
     private var iceDrainers: [String: Int] = [:]
 
-    // 원문: (AGENTS.md 10) / 종전에는 세션이 없으면 버려 실브라우저에서 세션마다 후보 100여 개 중 36–50개가 사라졌다.
+    // 종전에는 세션이 없으면 버려 실브라우저에서 세션마다 후보 100여 개 중 36–50개가 사라졌다.
     /// Early viewer ICE — per session key, candidates that cannot be handed over yet are held in arrival order: the
     /// current attempt's candidates that arrive before the session exists (during the ICE-server lookup · the factory) or
     /// before the session has applied the offer (before ``BroadcastSession/answer(offerSdp:)`` returns), and candidates
@@ -559,7 +558,7 @@ public actor ScreenBroadcast {
     private func reconcileViewers(_ peerList: Any?) {
         guard let peers = peerList as? [Any] else { return }
         let present = Set(peers.compactMap { ($0 as? [String: Any])?["participantId"] as? String })
-        // offer 없이 쥐어 둔 떠난 참여자의 이른 ICE 는 끊김 스냅샷이 없어도 버린다(AGENTS.md 10).
+        // offer 없이 쥐어 둔 떠난 참여자의 이른 ICE 는 끊김 스냅샷이 없어도 버린다.
         for key in iceQueues.keys where generations[key] == nil && !present.contains(ScreenBroadcast.viewerOf(key)) {
             dropIceState(key)
         }
@@ -662,7 +661,7 @@ public actor ScreenBroadcast {
             if generations[key] == nil {
                 let siblings = generations.filter { ScreenBroadcast.viewerOf($0.key) == viewer }
                 // 살아 있다고 알 수 없는 세션(올라간 세션이 아직 없거나 — 첫 협상 중 — 올라간 세션을 만든 세대가 answer 를 아직
-                // 보내지 않았다)이 먼저, 그다음 가장 작은 세대(AGENTS.md 8). answer 를 보낸 세션은 그 수신기의 재협상이 진행 중이어도
+                // 보내지 않았다)이 먼저, 그다음 가장 작은 세대. answer 를 보낸 세션은 그 수신기의 재협상이 진행 중이어도
                 // 살아 있다.
                 let rank: (Dictionary<String, Int>.Element) -> (Int, Int) = { entry in
                     (self.isLive(entry.key) ? 1 : 0, entry.value)
@@ -692,7 +691,7 @@ public actor ScreenBroadcast {
             }
         case "ice":
             // 뷰어 ICE 도 receiverId 를 싣는다 — 그 수신기의 세션에만 붙인다. 세션 · offer 적용이 서기 전이면 쥐었다가 넘긴다
-            // (AGENTS.md 10). 붙이기는 기다리지 않는다: 앱 구현이 매달려도 다음 프레임을 막지 않게.
+            // 붙이기는 기다리지 않는다: 앱 구현이 매달려도 다음 프레임을 막지 않게.
             guard let viewer = frame["fromParticipantId"] as? String, !viewer.isEmpty,
                 let candidate = frame["candidate"] as? [String: Any]
             else { return }
@@ -887,7 +886,7 @@ public actor ScreenBroadcast {
         if let session = detach(key) { Task { await session.close() } }
     }
 
-    // ── 이른 뷰어 ICE(AGENTS.md 10) ────────────────────────────────────────
+    // ── 이른 뷰어 ICE ────────────────────────────────────────
 
     nonisolated static func nowMs() -> UInt64 { DispatchTime.now().uptimeNanoseconds / 1_000_000 }
 
@@ -1629,6 +1628,8 @@ final class OrderedInbox<Element>: @unchecked Sendable {
 }
 
 // 원문의 설계 번호: onRemoteInput … **주입은 앱 몫**(§4-3)
+/// Experimental: this API may change in a minor release before 1.0.
+///
 /// Starts a screen broadcast — see ``ScreenBroadcast``.
 ///
 /// - Parameters:

@@ -314,19 +314,12 @@ protocol DeclaresProvidesView: AnyObject {
 }
 
 /// The result of ``ConnectClient/ensureStreamLayer()`` — points at one layer, whether it was just created or
-/// already existed. The transport fills `renamed` (the name received on join ≠ the requested name), and the client
-/// sets `nameConflict` to the same value.
+/// already existed. The transport fills `renamed` (the name received on join ≠ the requested name).
 public struct EnsuredStreamLayer: Sendable, Equatable {
     public let layerId: String
     public let name: String
     /// Whether this call created it — server 201 = true, 200 (already existed) = false.
     public let created: Bool
-    // 호환용 옛 이름. roster 에서 같은 이름의 활성 참여자를 찾던 판정은 크래시 재시작 뒤 유예 중인 같은 키의 옛 행과 대기 짝을
-    // 충돌로 잘못 셌다(검수) — 이제 ``renamed`` 와 같다.
-    /// Deprecated — the same value as ``renamed``; read ``renamed``.
-    ///
-    /// A compatibility alias kept under its old name — now the same as ``renamed``.
-    public let nameConflict: Bool
     /// The server attached this adapter under a different name than the one requested (``ConnectClient/me``'s
     /// displayName ≠ the requested displayName — e.g. `gauge (2)`) — a different adapter key holds that name: a program
     /// on another key is attached under that name, or a layer of that name is still bound to another valid key (a
@@ -335,11 +328,10 @@ public struct EnsuredStreamLayer: Sendable, Equatable {
     /// this screen does not appear in the layer the designer placed under the original name.
     public let renamed: Bool
 
-    public init(layerId: String, name: String, created: Bool, nameConflict: Bool = false, renamed: Bool = false) {
+    public init(layerId: String, name: String, created: Bool, renamed: Bool = false) {
         self.layerId = layerId
         self.name = name
         self.created = created
-        self.nameConflict = nameConflict
         self.renamed = renamed
     }
 }

@@ -174,7 +174,7 @@ public final class SocketTransport: Transport, @unchecked Sendable {
         // false 도 실어 보낸다 — 규칙을 **끄는** 재신고가 여기서 걸리면 서버에 남은
         // 이전 true 때문에 어댑터가 영원히 대기로 판정된다.
         if let exclusiveName = options.exclusiveName { body["exclusiveName"] = exclusiveName }
-        // 어댑터 신원(ADR-0016 · D4) — 언어 · 라이브러리 판 · 런타임 종류와 판. 옵션이 아니라 언제나 싣는다(알아내지
+        // 어댑터 신원 — 언어 · 라이브러리 판 · 런타임 종류와 판. 옵션이 아니라 언제나 싣는다(알아내지
         // 못한 필드만 빠진다). 서버는 키 입장에서만 사용 장부에 남기고, 구 서버는 unknown key strip.
         for (key, value) in AdapterIdentity.fields() { body[key] = value }
 
@@ -189,6 +189,10 @@ public final class SocketTransport: Transport, @unchecked Sendable {
             request.setValue(cookie, forHTTPHeaderField: "Cookie")
         }
 
+        // 이미 취소된 태스크에서는 요청을 시작하지 않는다 — URLSession 은 취소된 태스크에서도 요청을 먼저 시작한 뒤
+        // 취소해, 재개 루프가 백오프 확인을 통과한 직후 close() 된 경우에도 token/validate 가 한 번 나갔다
+        // (CI 2026-11-04 · 복사본에서 확인 직후 0.3초 멈춤으로 재현).
+        try Task.checkCancellation()
         let data: Data
         let response: URLResponse
         do {
@@ -279,6 +283,9 @@ public final class SocketTransport: Transport, @unchecked Sendable {
     internal var fallbackPendingForTest: Bool { queue.sync { fallbackWork != nil } }
     internal var loopRunningForTest: Bool { queue.sync { reconnectTask != nil } }
     internal var endedForTest: Bool { queue.sync { ended } }
+    /// Test-only — runs in the reconnect loop right after the post-backoff check passes, before the revalidation. Set before
+    /// the loop starts; it lets a test close the transport at exactly that moment.
+    internal var afterBackoffCheckForTest: (() -> Void)?
     /// Holds the dedicated queue briefly — makes the order of work on the queue deterministic.
     internal func blockQueueForTest(_ seconds: Double) { queue.async { Thread.sleep(forTimeInterval: seconds) } }
     internal func confirmJoinedAsyncForTest(_ me: Member) { queue.async { self.confirmJoined(me: me, history: nil) } }
@@ -310,6 +317,16 @@ public final class SocketTransport: Transport, @unchecked Sendable {
         }
     }
     internal var pendingAckCountForTest: Int { queue.sync { pendingAcks.count } }
+    // 1초 상한과 벽시계로 겨루는 시험("확인 · 서버 끊김에서 곧바로 돌아온다" · "기다리는 사이 …")은 느린 CI 실행기에서 여유가
+    // 수백 ms 뿐이라 간헐 실패한다 — 그런 시험이 이 값을 길게 잡는다(C# 의 LeaveAckTimeoutForTest 와 같다).
+    /// Test-only — the cap this transport actually waits for the leave to be processed. Defaults to ``leaveAckTimeout``.
+    /// Set before `close()`.
+    internal var leaveAckTimeoutForTest: TimeInterval = SocketTransport.leaveAckTimeout
+    /// Test-only — whether `close()` has sent the leave and is waiting for it to be processed.
+    internal var leaveWaitingForTest: Bool { queue.sync { leaveWaiter != nil } }
+    /// Test-only — receives each wait (seconds, server floor included) right before the reconnect loop sleeps it. Set before
+    /// the loop starts; it lets a test read the waits themselves instead of timing the gaps between attempts.
+    internal var rejoinWaitForTest: ((TimeInterval) -> Void)?
 
     // ── Adapter Stream 레이어 자리 확보 ─────────────────────────────────────
 
@@ -492,8 +509,6 @@ public final class SocketTransport: Transport, @unchecked Sendable {
             // created 가 빠진 구 응답이면 상태코드로 접는다(201=새로 만듦) — TS 는 body 를
             // 그대로 믿지만 Swift 는 타입을 세워야 해서 여기서 한 번 확정한다.
             created: payload?["created"] as? Bool ?? (status == 201),
-            // nameConflict 는 renamed 의 옛 이름 — 트랜스포트를 바로 써도 같은 값이다.
-            nameConflict: trim(boundName) != trim(options.displayName),
             renamed: trim(boundName) != trim(options.displayName)
         )
     }
@@ -1052,12 +1067,14 @@ public final class SocketTransport: Transport, @unchecked Sendable {
                 if self.queue.sync(execute: { self.ended }) { return }
                 let wait = SocketTransport.rejoinWait(delay: delay, retryAfterMs: retryAfterMs)
                 retryAfterMs = nil
+                self.rejoinWaitForTest?(wait)
                 try? await Task.sleep(nanoseconds: UInt64(wait * 1_000_000_000))
                 // 잠든 사이 close() · 종결로 끝났다(markEnded 가 이 태스크를 취소한다) — 재검증을 하나 더 보내지 않는다.
                 // 취소된 잠은 `try?` 로 곧바로 깨어나 종전에는 그대로 validate 로 갔고, 취소된 태스크의 요청도
                 // 서버까지 나갔다 — 닫힌 뒤의 token/validate 한 번(입장 예산을 쓴다)이고, 시험에서는 그 요청이 다음
                 // 시험의 요청 수에 잡혀 `hits == 1` 확인 둘이 연달아 실패했다(CI macos-14).
                 if Task.isCancelled || self.queue.sync(execute: { self.ended }) { return }
+                self.afterBackoffCheckForTest?()
                 delay = min(delayMax, delay * 2)
 
                 do {
@@ -1380,13 +1397,19 @@ public final class SocketTransport: Transport, @unchecked Sendable {
         // 그 안에 다시 띄운 프로그램이 `이름 (2)` 로 붙었다. 기다리는 동안의 서버 끊김은 그 leave 의 응답이므로
         // `server-disconnect` 로 읽지 않는다(``closing``).
         if leaving { await leave() }
-        queue.sync {
+        let loop: Task<Void, Never>? = queue.sync {
+            let loop = reconnectTask
             markEnded()
             disposeSocket()
+            return loop
         }
+        // 취소한 재개 루프가 실제로 끝날 때까지 기다린다 — markEnded 는 취소만 하므로, 백오프 확인을 통과한 직후의
+        // 루프가 close() 반환 뒤에 재검증을 보낼 수 있었다. 루프의 잠 · 재검증 · 합류 대기는 모두 취소나 markEnded 로
+        // 곧바로 깨어난다.
+        await loop?.value
     }
 
-    // 서버의 leave 처리: `stageHandlers.ts` 의 Leave 핸들러.
+    // 서버의 leave 처리(스테이지 소켓 핸들러의 Leave).
     /// How long close() waits at most for `stage:leave` to be processed. On a leave the server records the member as left
     /// (one DB write), acks and disconnects — normally one round trip plus one write, tens to hundreds of ms. Past 1 second
     /// the server or network is already struggling, so waiting longer gains little, and shutdown (Ctrl+C · closing the app)
@@ -1403,11 +1426,12 @@ public final class SocketTransport: Transport, @unchecked Sendable {
             queue.async {
                 guard let socket = self.socket, socket.status == .connected else { return finish() }
                 self.leaveWaiter = finish
+                let cap = self.leaveAckTimeoutForTest
                 socket.emitWithAck(Protocol.ClientEvents.leave, [:] as [String: Any])
-                    .timingOut(after: SocketTransport.leaveAckTimeout) { _ in finish() }
+                    .timingOut(after: cap) { _ in finish() }
                 // 라이브러리 타임아웃은 소켓이 해제되면 발화하지 않는다(``call(socket:event:payload:)`` 주석) — 같은 기한의
                 // 폴백을 따로 건다.
-                self.queue.asyncAfter(deadline: .now() + SocketTransport.leaveAckTimeout + 0.05) { finish() }
+                self.queue.asyncAfter(deadline: .now() + cap + 0.05) { finish() }
             }
         }
         queue.sync { leaveWaiter = nil }

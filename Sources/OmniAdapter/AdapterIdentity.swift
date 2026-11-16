@@ -1,6 +1,6 @@
 import Foundation
 
-// 어댑터 신원(ADR-0016 · D4). TS `adapter-identity.ts` 미러. 정규화 두 함수는 여섯 언어가 같은 답을 내야 한다.
+// 어댑터 신원. TS `adapter-identity.ts` 미러. 정규화 두 함수는 여섯 언어가 같은 답을 내야 한다.
 /// Adapter identity — the four fields sent on token/validate (`adapter` · `adapterVersion` · `runtime` ·
 /// `runtimeVersion`). The Connect Omni server records them, on key joins only, in its usage ledger as
 /// `adapter.joined{adapter, runtime}`.
@@ -20,7 +20,7 @@ enum AdapterIdentity {
     /// This package's version — SwiftPM has no manifest version, so the top version heading of `CHANGELOG.md` is
     /// the source of truth (VERSIONING.md · release-swift.yml). `AdapterIdentityTests` compares against that heading —
     /// change both when bumping the version.
-    static let adapterVersion = "0.1.0-beta.2"
+    static let adapterVersion = "0.1.0"
 
     private static let adapterVersionRe = try! NSRegularExpression(pattern: Protocol.adapterVersionPattern)
     private static let runtimeVersionRe = try! NSRegularExpression(pattern: Protocol.runtimeVersionPattern)

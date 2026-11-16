@@ -3,13 +3,11 @@ import XCTest
 
 /// MemoryStage — 서버 없이 여러 프로그램이 서로를 트리거한다 (TS memory-stage.test.ts 미러).
 final class MemoryStageTests: XCTestCase {
-    /// 조건을 기다린다(최대 2초) — 고정 80ms 는 부하가 걸린 러너에서 뒤집힌다. 조건이 없으면 종전처럼 80ms.
+    /// 조건을 기다린다(TestTiming.hangGuard 까지 — 종전의 2초는 멈춘 러너에서 모자랐다). 고정 80ms 는 부하가 걸린 러너에서
+    /// 뒤집히므로 긍정 결과는 늘 조건으로 기다린다. 조건이 없으면 종전처럼 80ms — "아무 일도 없다"를 보기 전에만 쓴다.
     private func settle(_ until: (() async -> Bool)? = nil) async {
         guard let until else { try? await Task.sleep(nanoseconds: 80_000_000); return }
-        for _ in 0..<400 {
-            if await until() { return }
-            try? await Task.sleep(nanoseconds: 5_000_000)
-        }
+        await TestTiming.until(0, pollNanos: 5_000_000, until)
     }
     private func p(_ any: Any?) -> Primitive { Primitive.from(any)! }
 
@@ -296,7 +294,8 @@ final class MemoryStageTests: XCTestCase {
         let a = try await stage.join(MemoryJoinOptions(displayName: "a"))
         try await stage.disconnect(a)
         let pending = Task { try await a.send("bad.channel", p(1)) } // 끊긴 동안 → 큐
-        await settle()
+        // 큐에 들어간 뒤에 다시 잇는다 — 고정 대기 뒤에 이으면 느린 러너에서 직행 경로를 타 "(queued)" 가 빠진다.
+        await settle { await a.queuedCount == 1 }
         try await stage.reconnect(a)
         _ = try await pending.value
         await settle { a.diagnostics().contains { $0.code == "send-dropped" } }

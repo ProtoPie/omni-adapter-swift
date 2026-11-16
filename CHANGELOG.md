@@ -3,8 +3,24 @@
 All notable changes to the Swift adapter. Versioning follows
 [SemVer](https://semver.org). Each release is tagged `X.Y.Z` in the package
 repository `ProtoPie/omni-adapter-swift` (`swift-v*` in the main repository),
-independent of the other language packages. See `/VERSIONING.md` for the
-policy and `/docs/COMPATIBILITY.md` for the server requirement matrix.
+independent of the other language packages. The minimum Connect server per
+feature is listed in `docs/COMPATIBILITY.md`, which ships in the npm
+(`@studioxid/omni-adapter`) and NuGet (`StudioXid.OmniAdapter`) packages.
+
+## 0.1.0 (2026-11-16)
+
+- Removed: `EnsuredStreamLayer.nameConflict`, the deprecated alias of `renamed`.
+  Read `renamed`, which carries the same value.
+- Changed: the doc comments of the experimental entry points (`startScreenBroadcast`, `onSignaling`
+  · `sendSignaling` · `onRemoteInputHolder`) now open with "Experimental: this API may change in a
+  minor release before 1.0.", so IDE hovers show what `docs/COMPATIBILITY.md` marks 🧪. Documentation
+  only; no behaviour change.
+- Changed: the package now requires Swift 6.0 (Xcode 16) or newer; it still compiles in the Swift 5
+  language mode. Swift 5.9 and 5.10 toolchains are no longer tested.
+- Fixed: closing the adapter while it waited for a closed stage to reopen could still send one more
+  token revalidation after `close()` returned, spending the key's join budget. The reconnect loop now
+  checks for cancellation right before each revalidation request, and `close()` waits for the loop
+  to finish.
 
 ## 0.1.0-beta.2 (2026-11-02)
 
@@ -86,8 +102,8 @@ still change before 0.1.0.
   server.
 - `ck_` adapter keys, declarations, `strictRouting`, `exclusiveName`, `providesView`, screen
   broadcast and remote input need an adapter-enabled server (or web build). Older servers strip
-  the declarations without an error. See `docs/COMPATIBILITY.md` for the minimum server per
-  feature.
+  the declarations without an error. The minimum server per feature is in `docs/COMPATIBILITY.md`
+  (shipped in the npm and NuGet packages).
 
 ### Known limitations
 
@@ -102,5 +118,3 @@ still change before 0.1.0.
 - Under a backlog of more than 1000 waiting message callbacks the oldest are skipped
   (`latest()` stays exact), and the `events()` stream drops its oldest events under bursts.
 - No terminal CLI; `runDoctor()` offers the same checks as a library call.
-
-Detailed history: https://github.com/ProtoPie/omni-adapter/blob/main/docs/history/swift.md

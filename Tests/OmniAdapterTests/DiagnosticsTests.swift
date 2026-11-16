@@ -54,8 +54,8 @@ final class DiagnosticsTests: XCTestCase {
         try await client.open()
         transport.handlers.onError?(AdapterError("ValidationError", "clientType — bad"))
         transport.handlers.onEnded?("rejoin-abandoned: AuthRevoked")
-        // 종료 처리는 Task 로 넘어간다 — 기록이 정착할 창을 준다.
-        try await Task.sleep(nanoseconds: 100_000_000)
+        // 종료 처리는 인박스를 거쳐 반영된다 — 고정 대기 대신 마지막 기록(ended)이 남을 때까지 기다린다.
+        await TestTiming.until { client.diagnostics().contains { $0.code == "ended" } }
 
         let seen = client.diagnostics().map { "\($0.code):\($0.message)" }
         XCTAssertTrue(seen.contains("state:connected"), "실제: \(seen)")

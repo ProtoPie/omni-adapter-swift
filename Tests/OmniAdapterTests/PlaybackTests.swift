@@ -22,6 +22,7 @@ final class PlaybackTests: XCTestCase {
         let waits = Waits()
         return (stage, client, waits, { ms in waits.add(ms) })
     }
+    /// 고정 대기 — 뒤에 긍정 결과를 단언하지 않는다(TestTiming).
     private func settle() async { try? await Task.sleep(nanoseconds: 60_000_000) }
 
     /// 클라이언트의 단조 시계를 바꿔 끼운다 — 진척 없는 시간(15초)은 실제 단조 시계로 재므로, 시험은 이 시계를 앞으로 돌려 15초를
@@ -48,7 +49,9 @@ final class PlaybackTests: XCTestCase {
     }
 
     /// 기한 안에 끝나기를 기다린다 — 결함(풀리지 않는 기다림)이 있으면 매달리지 않고 실패한다: 기한이 지나면 작업을 취소하고 던진다.
+    /// 기한은 TestTiming.hangGuard 이상이다(끝나면 곧바로 돌아온다).
     private func bounded<T: Sendable>(_ seconds: Double = 10, _ operation: @escaping @Sendable () async throws -> T) async throws -> T {
+        let seconds = TestTiming.atLeastHangGuard(seconds)
         let done = Done()
         let task = Task { () async throws -> T in
             defer { done.set() }
@@ -62,13 +65,9 @@ final class PlaybackTests: XCTestCase {
         return try await task.value
     }
 
+    /// 조건이 참이 될 때까지 — 시한은 TestTiming.hangGuard 이상이다. "참이 되지 않는다"를 보는 자리에는 쓰지 않는다.
     private func until(_ seconds: Double = 3, _ condition: () async -> Bool) async -> Bool {
-        let deadline = Date().addingTimeInterval(seconds)
-        while Date() < deadline {
-            if await condition() { return true }
-            try? await Task.sleep(nanoseconds: 10_000_000)
-        }
-        return await condition()
+        await TestTiming.until(seconds, pollNanos: 10_000_000, condition)
     }
 
     func testParseAndFormatRoundTrip() throws {
@@ -325,7 +324,7 @@ final class PlaybackTests: XCTestCase {
         var acked: [Task<Void, Error>] = []  // 다른 발신자의 ack 발행들 — 끊긴 동안 큐에 든다
         for i in 0..<3 {
             acked.append(Task { try await client.send("a.x", .int(i), ack: true) })
-            for _ in 0..<200 where await client.queuedCount < i + 1 { try await Task.sleep(nanoseconds: 2_000_000) }
+            await TestTiming.until { await client.queuedCount >= i + 1 }
         }
         let done = Done()
         let replaying = Task {
@@ -402,7 +401,7 @@ final class PlaybackTests: XCTestCase {
             transport.handlers.onState?(.reconnecting)
             // 상태 전이는 클라이언트의 인박스를 거쳐 비동기로 반영된다 — 반영되기 전에 보내면 다음 ack 발행이 큐 대신 직행해
             // 시험이 흔들렸다(부하에서 15번 중 1번).
-            for _ in 0..<400 where await client.state != .reconnecting { try? await Task.sleep(nanoseconds: 5_000_000) }
+            await TestTiming.until { await client.state == .reconnecting }
             try? await client.send("g.y", .string("other"))  // 공백 동안 큐에 남은 것이 있다
             clock.advance(ms / 1000)
             gapPassed.set()
@@ -433,7 +432,8 @@ final class PlaybackTests: XCTestCase {
         transport.reject(.string("two"))
         let client = ConnectClient(transport: transport, exclusiveName: false)
         try await client.open()
-        let answering = Task { for _ in 0..<200 { transport.answerOne(); try? await Task.sleep(nanoseconds: 10_000_000) } }
+        // 취소될 때까지 답한다 — 횟수로 끊으면(200 × 10 ms) 느린 러너에서 재생이 끝나기 전에 답이 그친다.
+        let answering = Task { while !Task.isCancelled { transport.answerOne(); try? await Task.sleep(nanoseconds: 10_000_000) } }
         do {
             let records = rec
             _ = try await bounded { try await replay(client: client, records: records, options: ReplayOptions(speed: .infinity, ack: true)) }
@@ -483,17 +483,20 @@ final class PlaybackTests: XCTestCase {
     /// 한 발행을 기다리는 사이 취소 — 곧바로 돌아오고, 감시 루프가 남지 않는다.
     func testCancellingDuringASendWaitReturnsPromptlyAndLeavesNothingRunning() async throws {
         let (stage, client, _, _) = try await harness()
+        // 단조 시계를 멈춰 둔다 — 취소가 듣지 않으면 진척 없는 시간(15초)이 영영 차지 않아 돌아오지 않는다. 실제 시계로 두고
+        // "2초 안"을 재던 종전에는 멈춘 러너에서 거짓 실패했고, 상한을 넉넉히 늘리면 15초 뒤의 포기(같은 sent 0)와 구별되지 않았다.
+        _ = await fakeClock(client)
         try await stage.disconnect(client)
         try await waitUntilState(client, .reconnecting)
-        let started = Date()
         let run = Task {
             try await replay(client: client, records: Array(rec.prefix(2)), options: ReplayOptions(speed: .infinity, ack: true))
         }
-        try await Task.sleep(nanoseconds: 150_000_000)
+        // 발행 하나를 기다리기 시작한 뒤에 취소한다(고정 대기 대신 감시 루프가 뜬 것을 본다).
+        let watching = await until { runningWatchdogsForTest.value > 0 }
+        XCTAssertTrue(watching, "the watchdog did not start")
         run.cancel()
-        let r = try await run.value
+        let r = try await bounded { try await run.value }  // 곧바로 돌아온다 — 결함이면 hangGuard 에 걸린다
         XCTAssertEqual(r.sent, 0)
-        XCTAssertLessThan(Date().timeIntervalSince(started), 2)
         XCTAssertEqual(runningWatchdogsForTest.value, 0)
     }
 
@@ -517,7 +520,7 @@ final class PlaybackTests: XCTestCase {
         let r = try await replaying.value
         XCTAssertEqual(r.sent, 0)  // 큐에 남은 채 15초(단조 시계) — 포기
         await client.close()  // 그 발행이 이제 SessionEnded 로 끝난다
-        try await Task.sleep(nanoseconds: 50_000_000)
+        try await Task.sleep(nanoseconds: 50_000_000)  // 뒤늦은 결과가 새지 않는지 볼 창 — 아래 값은 돌아온 때 이미 0 이다
         XCTAssertEqual(runningWatchdogsForTest.value, 0)
     }
 
@@ -532,7 +535,7 @@ final class PlaybackTests: XCTestCase {
         var others: [Task<Void, Error>] = []  // 앞선 ack 발행들
         for i in 0..<3 {
             others.append(Task { try await client.send("a.x", .int(i), ack: true) })
-            for _ in 0..<200 where await client.queuedCount < i + 1 { try await Task.sleep(nanoseconds: 2_000_000) }
+            await TestTiming.until { await client.queuedCount >= i + 1 }
         }
         let done = Done()
         let replaying = Task {
@@ -552,10 +555,8 @@ final class PlaybackTests: XCTestCase {
     }
 
     private func waitUntilState(_ client: ConnectClient, _ want: TransportState) async throws {
-        for _ in 0..<200 {
-            if await client.state == want { return }
-            try await Task.sleep(nanoseconds: 5_000_000)
-        }
+        let reached = await TestTiming.until { await client.state == want }
+        if reached { return }
         XCTFail("state never became \(want)")
     }
 
@@ -652,9 +653,5 @@ final class PlaybackTests: XCTestCase {
 
 /// end 는 액터 홉을 거쳐 클라이언트 상태에 반영된다 — 고정 sleep 은 부하가 걸린 러너에서 뒤집히므로 상태를 확인한다.
 private func untilEnded(_ client: ConnectClient) async {
-    var spins = 0
-    while await client.state != .ended, spins < 400 {
-        spins += 1
-        try? await Task.sleep(nanoseconds: 5_000_000)
-    }
+    await TestTiming.until { await client.state == .ended }
 }

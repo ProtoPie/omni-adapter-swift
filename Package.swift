@@ -1,4 +1,4 @@
-// swift-tools-version:5.9
+// swift-tools-version:6.0
 import PackageDescription
 
 let package = Package(
@@ -47,5 +47,8 @@ let package = Package(
             dependencies: ["OmniAdapter"],
             path: "Examples/Resilience"
         ),
-    ]
+    ],
+    // 하한은 Swift 6.0(Xcode 16)이다 — CI 러너(macos-15)에서 검증할 수 있는 가장 낮은 판이다. 언어 모드는 5 로 둔다:
+    // 6 모드의 엄격한 동시성 검사는 공개 API 를 바꾸는 별도 작업이다.
+    swiftLanguageModes: [.v5]
 )

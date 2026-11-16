@@ -198,7 +198,7 @@ final class DoctorTests: XCTestCase {
         XCTAssertEqual(fixtureKey.count, 46)
     }
 
-    /// validate 503 KeyMaterialUnavailable(connect-v2 8fea9402d) — warn(기다릴 일)이고 힌트가 서버의 retryAfterMs 와 처방을 말한다 · join 까지 간다.
+    /// validate 503 KeyMaterialUnavailable — warn(기다릴 일)이고 힌트가 서버의 retryAfterMs 와 처방을 말한다 · join 까지 간다.
     func testValidate503KeyMaterialUnavailableIsWarnAndContinuesToJoin() async {
         let transport = RosterTransport(members: [Member(participantId: "me-1", displayName: "doctor")])
         let results = await runDoctor(

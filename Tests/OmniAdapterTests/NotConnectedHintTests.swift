@@ -86,7 +86,7 @@ final class NotConnectedHintTests: XCTestCase {
 
         transport.holdOpen(true)
         let opening = Task { try await client.open() }  // connecting — 합류 응답을 기다린다
-        for _ in 0..<200 where await client.state != .connecting { try await Task.sleep(nanoseconds: 5_000_000) }
+        await TestTiming.until { await client.state == .connecting }
         let state = await client.state
         XCTAssertEqual(state, .connecting)
         await allCallsCarry(client, notJoined)
@@ -99,7 +99,7 @@ final class NotConnectedHintTests: XCTestCase {
         let client = ConnectClient(transport: transport)
         try await client.open()
         transport.handlers.onState?(.reconnecting)
-        for _ in 0..<200 where await client.state != .reconnecting { try await Task.sleep(nanoseconds: 5_000_000) }
+        await TestTiming.until { await client.state == .reconnecting }
         await allCallsCarry(client, reconnecting)
         let resume = await failure { _ = try await client.resumeRegistration(deviceSecret: "secret") }
         XCTAssertEqual(resume?.code, "NotConnected")
@@ -121,7 +121,7 @@ final class NotConnectedHintTests: XCTestCase {
         let client = ConnectClient(transport: transport)
         try await client.open()
         transport.handlers.onState?(.reconnecting)
-        for _ in 0..<200 where await client.state != .reconnecting { try await Task.sleep(nanoseconds: 5_000_000) }
+        await TestTiming.until { await client.state == .reconnecting }
         let members = await failure { _ = try await client.members() }
         XCTAssertEqual(members?.hint, "the transport knows better")
     }
@@ -131,7 +131,7 @@ final class NotConnectedHintTests: XCTestCase {
         let stage = MemoryStage()
         let client = try await stage.join(MemoryJoinOptions(displayName: "m"))
         try await stage.disconnect(client)
-        for _ in 0..<200 where await client.state != .reconnecting { try await Task.sleep(nanoseconds: 5_000_000) }
+        await TestTiming.until { await client.state == .reconnecting }
         let dropped = await failure { _ = try await client.members() }
         XCTAssertEqual(dropped?.code, "NotConnected")
         XCTAssertEqual(dropped?.hint, reconnecting)
@@ -179,7 +179,7 @@ final class SignalingAfterEndTests: XCTestCase {
     }
 
     private func untilEnded(_ client: ConnectClient) async {
-        for _ in 0..<400 where await client.state != .ended { try? await Task.sleep(nanoseconds: 5_000_000) }
+        await TestTiming.until { await client.state == .ended }
     }
 
     /// close() 는 먼저 끝내고 퇴장 확인을 기다린다(최대 1초) — 그 사이의 시그널링이 서버에 닿아 중계됐다(검수 실측 90/90).

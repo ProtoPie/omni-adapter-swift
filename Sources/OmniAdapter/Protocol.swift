@@ -51,7 +51,7 @@ public enum Protocol {
     /// doctor reports "a server that does not accept adapters" instead of "the key was revoked".
     public static let aboutCapabilityFields = ["adapterGuest"]
 
-    // 어댑터 신원(ADR-0016 · D4) — 서버 zod `.regex(/…/)` 의 원문, TS protocol.ts 와 락스텝.
+    // 어댑터 신원 — 서버 zod `.regex(/…/)` 의 원문, TS protocol.ts 와 락스텝.
     /// Adapter identity — the server's patterns for `adapterVersion` and `runtimeVersion` on token/validate.
     /// A value that does not match is not sent; the field is omitted (`AdapterIdentity`).
     public static let adapterVersionPattern = "^[0-9][0-9a-zA-Z.+-]{0,31}$"
